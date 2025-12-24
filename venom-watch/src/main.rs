@@ -107,13 +107,24 @@ fn main() {
 
 fn analyze_file(path: &PathBuf, struct_name: &str, _role: &str) -> Result<StructLayout, String> {
     let code = fs::read_to_string(path).map_err(|e| format!("Could not read file {}: {}", path.display(), e))?;
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     
     let mut parser = TSParser::new();
-    let language = tree_sitter_c::LANGUAGE;
-    parser.set_language(&language.into()).expect("Error loading C grammar");
+    let is_rust = ext == "rs";
+    let language = if is_rust {
+        tree_sitter_rust::LANGUAGE
+    } else {
+        tree_sitter_c::LANGUAGE
+    };
+    
+    parser.set_language(&language.into()).expect("Error loading grammar");
 
     let tree = parser.parse(&code, None).expect("Failed to parse code");
     let root_node = tree.root_node();
+
+    if is_rust {
+        return analyze_rust_struct(struct_name, &code, root_node, path.to_string_lossy().to_string());
+    }
 
     // Query to find the struct definition
     let query_str = format!(
@@ -184,13 +195,21 @@ fn parse_fields(fields_list_node: tree_sitter::Node, struct_name: &str, code: &s
                  let size_node = decl_node.child_by_field_name("size").unwrap();
                  let size_str = size_node.utf8_text(code.as_bytes()).unwrap();
                  let len = parse_array_size(size_str);
-                 (inner_decl.utf8_text(code.as_bytes()).unwrap(), true, len)
+                 let actual_name = if inner_decl.kind() == "pointer_declarator" {
+                     inner_decl.child_by_field_name("declarator").unwrap().utf8_text(code.as_bytes()).unwrap()
+                 } else {
+                     inner_decl.utf8_text(code.as_bytes()).unwrap()
+                 };
+                 (actual_name, true, len)
+             } else if decl_node.kind() == "pointer_declarator" {
+                 (decl_node.child_by_field_name("declarator").unwrap().utf8_text(code.as_bytes()).unwrap(), false, 1)
              } else {
                  (decl_node.utf8_text(code.as_bytes()).unwrap(), false, 1)
              };
 
-             let size = get_type_size(type_text, code, root_node) * array_len;
-             let align = get_type_alignment(type_text);
+             let is_pointer = type_text.contains('*') || decl_node.kind() == "pointer_declarator";
+             let size = if is_pointer { 8 } else { get_type_size(type_text, code, root_node) } * array_len;
+             let align = if is_pointer { 8 } else { get_type_alignment(type_text, code, root_node) };
              
              let padding = (align - (current_offset % align)) % align;
              current_offset += padding;
@@ -198,9 +217,6 @@ fn parse_fields(fields_list_node: tree_sitter::Node, struct_name: &str, code: &s
              // Extract line number
              let start_pos = decl_node.start_position();
              let line = start_pos.row + 1;
-
-             // Detect pointers
-             let is_pointer = type_text.contains('*') || decl_node.kind() == "pointer_declarator";
 
              fields.push(Field {
                  name: name.to_string(),
@@ -217,7 +233,10 @@ fn parse_fields(fields_list_node: tree_sitter::Node, struct_name: &str, code: &s
         }
     }
     
-    let max_align = fields.iter().map(|f| get_type_alignment(&f.type_name)).max().unwrap_or(1);
+    let max_align = fields.iter().map(|f| {
+        let is_ptr = f.type_name.contains('*') || f.is_pointer;
+        if is_ptr { 8 } else { get_type_alignment(&f.type_name, code, root_node) }
+    }).max().unwrap_or(1);
     let padding = (max_align - (current_offset % max_align)) % max_align;
     current_offset += padding;
 
@@ -227,6 +246,110 @@ fn parse_fields(fields_list_node: tree_sitter::Node, struct_name: &str, code: &s
         total_size: current_offset,
         file_path,
     })
+}
+
+fn analyze_rust_struct(struct_name: &str, code: &str, root_node: tree_sitter::Node, file_path: String) -> Result<StructLayout, String> {
+    let language = tree_sitter_rust::LANGUAGE;
+    // Find struct with potential #[repr(C)]
+    let query_str = format!(
+        r#"
+        (struct_item
+            name: (type_identifier) @name
+            body: (field_declaration_list) @fields
+        ) @item
+        "#
+    );
+    
+    let query = Query::new(&language.into(), &query_str).expect("Invalid query");
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root_node, code.as_bytes());
+
+    while let Some(m) = matches.next() {
+        let name_node = m.captures[1].node;
+        let r_struct_name = name_node.utf8_text(code.as_bytes()).unwrap();
+
+        if r_struct_name == struct_name {
+            let fields_node = m.captures[2].node;
+            return parse_rust_fields(fields_node, struct_name, code, root_node, file_path);
+        }
+    }
+    
+    Err(format!("Rust struct '{}' not found", struct_name))
+}
+
+fn parse_rust_fields(fields_list_node: tree_sitter::Node, struct_name: &str, code: &str, root_node: tree_sitter::Node, file_path: String) -> Result<StructLayout, String> {
+    let mut fields = Vec::new();
+    let mut current_offset = 0;
+    
+    let mut cursor = fields_list_node.walk();
+    for child in fields_list_node.children(&mut cursor) {
+        if child.kind() == "field_declaration" {
+             let type_node = child.child_by_field_name("type").ok_or("No type")?;
+             let name_node = child.child_by_field_name("name").ok_or("No name")?;
+             
+             let name = name_node.utf8_text(code.as_bytes()).unwrap();
+             let type_text = type_node.utf8_text(code.as_bytes()).unwrap();
+             
+             let (size, align, is_array, array_len) = get_rust_type_info(type_text, code, root_node);
+             
+             let padding = (align - (current_offset % align)) % align;
+             current_offset += padding;
+
+             fields.push(Field {
+                 name: name.to_string(),
+                 type_name: type_text.to_string(),
+                 size,
+                 offset: current_offset,
+                 is_array,
+                 array_len,
+                 line: name_node.start_position().row + 1,
+                 is_pointer: type_text.contains('*') || type_text.starts_with('&'),
+             });
+
+             current_offset += size;
+        }
+    }
+    
+    let max_align = fields.iter().map(|f| {
+        let (_, align, _, _) = get_rust_type_info(&f.type_name, code, root_node);
+        align
+    }).max().unwrap_or(1);
+    let padding = (max_align - (current_offset % max_align)) % max_align;
+    current_offset += padding;
+
+    Ok(StructLayout {
+        name: struct_name.to_string(),
+        fields,
+        total_size: current_offset,
+        file_path,
+    })
+}
+
+fn get_rust_type_info(t: &str, code: &str, root_node: tree_sitter::Node) -> (usize, usize, bool, usize) {
+    let t = t.trim();
+    // Handle arrays [T; N]
+    if t.starts_with('[') && t.contains(';') {
+        let inner = &t[1..t.len()-1];
+        let parts: Vec<&str> = inner.split(';').collect();
+        if parts.len() == 2 {
+            let inner_type = parts[0].trim();
+            let size_str = parts[1].trim();
+            let len = size_str.parse::<usize>().unwrap_or(1);
+            let (inner_size, inner_align, _, _) = get_rust_type_info(inner_type, code, root_node);
+            return (inner_size * len, inner_align, true, len);
+        }
+    }
+
+    let (size, align) = match t {
+        "u8" | "i8" | "bool" => (1, 1),
+        "u16" | "i16" => (2, 2),
+        "u32" | "i32" | "f32" => (4, 4),
+        "u64" | "i64" | "f64" | "usize" | "isize" => (8, 8),
+        _ if t.starts_with('&') || t.contains('*') => (8, 8),
+        _ => (4, 4), // Fallback
+    };
+    
+    (size, align, false, 1)
 }
 
 fn parse_array_size(s: &str) -> usize {
@@ -247,7 +370,7 @@ fn get_type_size(t: &str, code: &str, root_node: tree_sitter::Node) -> usize {
         "char" | "int8_t" | "uint8_t" => 1,
         "short" | "int16_t" | "uint16_t" => 2,
         "int" | "int32_t" | "uint32_t" | "float" | "gint" | "guint32" | "gboolean" => 4,
-        "long" | "int64_t" | "uint64_t" | "double" | "size_t" | "guint64" => 8,
+        "long" | "int64_t" | "uint64_t" | "double" | "size_t" | "guint64" | "uintptr_t" => 8,
         _ => {
             if t.ends_with('*') { 
                 8 
@@ -309,13 +432,22 @@ fn find_and_parse_struct(struct_name: &str, code: &str, root_node: tree_sitter::
     Err("Struct not found".to_string())
 }
 
-fn get_type_alignment(t: &str) -> usize {
+fn get_type_alignment(t: &str, code: &str, root_node: tree_sitter::Node) -> usize {
     match t {
         "char" | "int8_t" | "uint8_t" => 1,
         "short" | "int16_t" | "uint16_t" => 2,
         "int" | "int32_t" | "uint32_t" | "float" | "gint" | "guint32" | "gboolean" => 4,
-        "long" | "int64_t" | "uint64_t" | "double" | "size_t" | "guint64" => 8,
-        _ => 1,
+        "long" | "int64_t" | "uint64_t" | "double" | "size_t" | "guint64" | "uintptr_t" => 8,
+        _ => {
+            if let Ok(layout) = find_and_parse_struct(t, code, root_node) {
+                layout.fields.iter().map(|f| {
+                    let is_ptr = f.type_name.contains('*') || f.is_pointer;
+                    if is_ptr { 8 } else { get_type_alignment(&f.type_name, code, root_node) }
+                }).max().unwrap_or(1)
+            } else {
+                1
+            }
+        }
     }
 }
 
@@ -335,13 +467,61 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) {
     println!("\n{:<20} | {:<16} | {:<16} | {:<30}", "Field", "Server (Line)", "Client (Line)", "Status");
     println!("{}", "-".repeat(90));
 
-    let max_fields = std::cmp::max(server.fields.len(), client.fields.len());
-    
-    for i in 0..max_fields {
-        let server_field = server.fields.get(i);
-        let client_field = client.fields.get(i);
+    let mut s_idx = 0;
+    let mut c_idx = 0;
+    let mut s_current_offset = 0;
+    let mut c_current_offset = 0;
 
-        match (server_field, client_field) {
+    loop {
+        let s_field = server.fields.get(s_idx);
+        let c_field = client.fields.get(c_idx);
+
+        if s_field.is_none() && c_field.is_none() {
+            // Check for trailing padding (struct total size vs last field)
+            if s_current_offset < server.total_size || c_current_offset < client.total_size {
+                let s_pad = server.total_size - s_current_offset;
+                let c_pad = client.total_size - c_current_offset;
+                if s_pad > 0 || c_pad > 0 {
+                    println!("{:<20} | {:<16} | {:<16} | {}", 
+                        "[TRAILING PAD]".cyan().dimmed(),
+                        if s_pad > 0 { format!("{} bytes", s_pad).cyan() } else { "N/A".into() },
+                        if c_pad > 0 { format!("{} bytes", c_pad).cyan() } else { "N/A".into() },
+                        if s_pad == c_pad { "✅ OK".green() } else { "⚠️  Mismatch".yellow() }
+                    );
+                }
+            }
+            break;
+        }
+
+        // Check for internal padding in server
+        if let Some(s) = s_field {
+            if s.offset > s_current_offset {
+                let pad = s.offset - s_current_offset;
+                println!("{:<20} | {:<16} | {:<16} | {}", 
+                    "[PADDING]".cyan().dimmed(),
+                    format!("{} bytes", pad).cyan(),
+                    "",
+                    "INTERNAL".dimmed()
+                );
+                s_current_offset = s.offset;
+            }
+        }
+
+        // Check for internal padding in client
+        if let Some(c) = c_field {
+            if c.offset > c_current_offset {
+                let pad = c.offset - c_current_offset;
+                println!("{:<20} | {:<16} | {:<16} | {}", 
+                    "[PADDING]".cyan().dimmed(),
+                    "",
+                    format!("{} bytes", pad).cyan(),
+                    "INTERNAL".dimmed()
+                );
+                c_current_offset = c.offset;
+            }
+        }
+
+        match (s_field, c_field) {
             (Some(s), Some(c)) => {
                 let status = if s.offset != c.offset {
                     "❌ Offset Mismatch".red()
@@ -353,7 +533,6 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) {
                      "✅ OK".green()
                 };
 
-                // Add pointer warning if detected
                 let mut status_str = status.to_string();
                 if s.is_pointer || c.is_pointer {
                     status_str = format!("{} | {}", status_str, "🚨 POINTER DANGER!".on_red().white().bold());
@@ -368,6 +547,10 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) {
                     c_info, 
                     status_str
                 );
+                s_current_offset = s.offset + s.size;
+                c_current_offset = c.offset + c.size;
+                s_idx += 1;
+                c_idx += 1;
             },
             (Some(s), None) => {
                  let mut status_str = "❌ Missing in Client".red().to_string();
@@ -376,6 +559,8 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) {
                  }
                  let s_info = format!("@{: <4} (L{})", s.offset, s.line);
                  println!("{:<20} | {:<16} | {:<16} | {}", s.name, s_info, "MISSING", status_str);
+                 s_current_offset = s.offset + s.size;
+                 s_idx += 1;
             },
             (None, Some(c)) => {
                  let mut status_str = "❌ Extra in Client".red().to_string();
@@ -384,8 +569,10 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) {
                  }
                  let c_info = format!("@{: <4} (L{})", c.offset, c.line);
                  println!("{:<20} | {:<16} | {:<16} | {}", c.name, "MISSING", c_info, status_str);
+                 c_current_offset = c.offset + c.size;
+                 c_idx += 1;
             },
-            (None, None) => break,
+            _ => unreachable!(),
         }
     }
 }
