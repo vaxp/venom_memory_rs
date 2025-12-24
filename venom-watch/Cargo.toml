@@ -1,0 +1,12 @@
+[package]
+name = "venom-watch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+any_ascii = "0.3.3"
+clap = { version = "4.5.53", features = ["derive"] }
+colored = "3.0.0"
+streaming-iterator = "0.1.9"
+tree-sitter = "0.26.3"
+tree-sitter-c = "0.24.1"
