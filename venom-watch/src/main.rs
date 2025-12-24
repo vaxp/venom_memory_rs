@@ -71,36 +71,52 @@ fn main() {
 
     println!("{}", "🕵️ Venom Watch: Validating IPC Structures...".cyan().bold());
 
+    let mut success = true;
+
     if let Some(ref s_name) = args.struct_name {
-        let server_layout = analyze_file(&args.server, s_name, "Server").unwrap_or_else(|e| {
+        let server_path = PathBuf::from(&args.server);
+        let client_path = PathBuf::from(&args.client);
+
+        let server_layout = analyze_file(&server_path, s_name, "Server").unwrap_or_else(|e| {
             eprintln!("{} {}", "❌ Server struct analysis failed:".red(), e);
             std::process::exit(1);
         });
 
-        let client_layout = analyze_file(&args.client, s_name, "Client").unwrap_or_else(|e| {
+        let client_layout = analyze_file(&client_path, s_name, "Client").unwrap_or_else(|e| {
             eprintln!("{} {}", "❌ Client struct analysis failed:".red(), e);
             std::process::exit(1);
         });
 
-        compare_layouts(&server_layout, &client_layout);
+        if !compare_layouts(&server_layout, &client_layout) {
+            success = false;
+        }
     }
 
     if let Some(ref e_name) = args.enum_name {
-        let server_enum = analyze_enum(&args.server, e_name).unwrap_or_else(|e| {
+        let server_path = PathBuf::from(&args.server);
+        let client_path = PathBuf::from(&args.client);
+
+        let server_enum = analyze_enum(&server_path, e_name).unwrap_or_else(|e| {
             eprintln!("{} {}", "❌ Server enum analysis failed:".red(), e);
             std::process::exit(1);
         });
 
-        let client_enum = analyze_enum(&args.client, e_name).unwrap_or_else(|e| {
+        let client_enum = analyze_enum(&client_path, e_name).unwrap_or_else(|e| {
             eprintln!("{} {}", "❌ Client enum analysis failed:".red(), e);
             std::process::exit(1);
         });
 
-        compare_enums(&server_enum, &client_enum);
+        if !compare_enums(&server_enum, &client_enum) {
+            success = false;
+        }
     }
 
     if args.struct_name.is_none() && args.enum_name.is_none() {
         eprintln!("{}", "❌ Error: Please specify either --struct-name or --enum-name".red());
+        std::process::exit(1);
+    }
+
+    if !success {
         std::process::exit(1);
     }
 }
@@ -451,15 +467,18 @@ fn get_type_alignment(t: &str, code: &str, root_node: tree_sitter::Node) -> usiz
     }
 }
 
-fn compare_layouts(server: &StructLayout, client: &StructLayout) {
+fn compare_layouts(server: &StructLayout, client: &StructLayout) -> bool {
     println!("\n{}: {} bytes", "Server Struct".green(), server.total_size);
     println!("{}: {} bytes", "Client Struct".yellow(), client.total_size);
     println!("--------------------------------------------------");
+
+    let mut all_match = true;
 
     if server.total_size != client.total_size {
         println!("{}", "⚠️  SIZE MISMATCH IDENTIFIED!".red().bold());
         println!("Expected: {} bytes", server.total_size);
         println!("Found:    {} bytes", client.total_size);
+        all_match = false;
     } else {
         println!("{}", "✅ Total sizes match.".green());
     }
@@ -524,8 +543,10 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) {
         match (s_field, c_field) {
             (Some(s), Some(c)) => {
                 let status = if s.offset != c.offset {
+                    all_match = false;
                     "❌ Offset Mismatch".red()
                 } else if s.size != c.size {
+                    all_match = false;
                     "❌ Size Mismatch".red()
                 } else if s.name != c.name {
                      "⚠️ Name Diff".yellow()
@@ -553,6 +574,7 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) {
                 c_idx += 1;
             },
             (Some(s), None) => {
+                 all_match = false;
                  let mut status_str = "❌ Missing in Client".red().to_string();
                  if s.is_pointer {
                      status_str = format!("{} | {}", status_str, "🚨 POINTER DANGER!".on_red().white().bold());
@@ -563,6 +585,7 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) {
                  s_idx += 1;
             },
             (None, Some(c)) => {
+                 all_match = false;
                  let mut status_str = "❌ Extra in Client".red().to_string();
                  if c.is_pointer {
                      status_str = format!("{} | {}", status_str, "🚨 POINTER DANGER!".on_red().white().bold());
@@ -575,6 +598,7 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) {
             _ => unreachable!(),
         }
     }
+    all_match
 }
 
 // -----------------------------------------------------------------------------
@@ -670,7 +694,7 @@ fn parse_enum_list(list_node: tree_sitter::Node, name: &str, code: &str, path: S
     })
 }
 
-fn compare_enums(server: &EnumLayout, client: &EnumLayout) {
+fn compare_enums(server: &EnumLayout, client: &EnumLayout) -> bool {
     println!("\n{}: {} members", "Server Enum".green(), server.members.len());
     println!("{}: {} members", "Client Enum".yellow(), client.members.len());
     println!("--------------------------------------------------");
@@ -724,4 +748,5 @@ fn compare_enums(server: &EnumLayout, client: &EnumLayout) {
     } else {
         println!("\n{}", "⚠️  ENUM INCONSISTENCY DETECTED!".red().bold());
     }
+    all_match
 }

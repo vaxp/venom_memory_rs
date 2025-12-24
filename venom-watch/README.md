@@ -24,6 +24,10 @@
 - **Color-Coded Feedback**: Instant visual confirmation (Green = Match, Red = Mismatch, Yellow = Warning).
 - **Table View**: Comprehensive side-by-side comparison of layouts.
 
+### 5. CI/CD & Automation Support 🚀
+- **Automated Guardrails**: Returns a non-zero exit code (1) if validation fails, preventing broken ABIs from being merged.
+- **Pipeline Integration**: Perfect for use as a pre-commit hook or as a step in a GitHub Actions workflow.
+
 ---
 
 ## 🛠️ Installation
@@ -230,3 +234,46 @@ CMD_SET_PROFILE           | 13 (L88)        | 13 (L91)        | ✅ OK
 CMD_REFRESH               | 14 (L89)        | 14 (L92)        | ✅ OK
 
 ✅ Enums are fully consistent!
+
+------------------------------------------------------------------------------------------
+
+x@x-HP-ZBook-15u-G6:~/Desktop/venom_memory_rs/venom-watch$ cargo build && ./target/debug/venom-watch --server /home/x/Desktop/venom_memory_rs/venom_audio/include/venom_ipc.h --client /home/x/Desktop/venom_memory_rs/venom_audio/audio_client.c --struct-name VenomAudioState && echo "Exit code: $?"
+   Compiling venom-watch v0.1.0 (/home/x/Desktop/venom_memory_rs/venom-watch)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.43s
+🕵️ Venom Watch: Validating IPC Structures...
+
+Server Struct: 13240 bytes
+Client Struct: 13240 bytes
+--------------------------------------------------
+✅ Total sizes match.
+
+Field                | Server (Line)    | Client (Line)    | Status                        
+------------------------------------------------------------------------------------------
+magic                | @0    (L38)      | @0    (L56)      | ✅ OK
+version              | @4    (L39)      | @4    (L57)      | ✅ OK
+volume               | @8    (L42)      | @8    (L58)      | ✅ OK
+mic_volume           | @12   (L43)      | @12   (L59)      | ✅ OK
+muted                | @16   (L44)      | @16   (L60)      | ✅ OK
+mic_muted            | @17   (L45)      | @17   (L61)      | ✅ OK
+overamplification    | @18   (L46)      | @18   (L62)      | ✅ OK
+_pad1                | @19   (L47)      | @19   (L63)      | ✅ OK
+max_volume           | @20   (L48)      | @20   (L64)      | ✅ OK
+default_sink         | @24   (L51)      | @24   (L65)      | ✅ OK
+default_source       | @152  (L52)      | @152  (L66)      | ✅ OK
+sink_count           | @280  (L55)      | @280  (L67)      | ✅ OK
+sinks                | @284  (L56)      | @284  (L68)      | ✅ OK
+source_count         | @4508 (L59)      | @4508 (L69)      | ✅ OK
+sources              | @4512 (L60)      | @4512 (L70)      | ✅ OK
+app_count            | @8736 (L63)      | @8736 (L71)      | ✅ OK
+apps                 | @8740 (L64)      | @8740 (L72)      | ✅ OK
+[PADDING]            | 4 bytes          |                  | INTERNAL
+[PADDING]            |                  | 4 bytes          | INTERNAL
+update_counter       | @13224 (L67)     | @13224 (L73)     | ✅ OK
+timestamp_ns         | @13232 (L68)     | @13232 (L74)     | ✅ OK
+Exit code: 0
+x@x-HP-ZBook-15u-G6:~/Desktop/venom_memory_rs/venom-watch$ cd /home/x/Desktop/venom_memory_rs/venom-watch/
+x@x-HP-ZBook-15u-G6:~/Desktop/venom_memory_rs/venom-watch$ ./target/debug/venom-watch --server /home/x/Desktop/venom_memory_rs/venom_audio/include/venom_ipc.h --client /home/x/Desktop/venom_memory_rs/venom_audio/audio_client.c --struct-name NonExistentStruct && echo "Exit code: $?" || echo "Exit code: $?"
+🕵️ Venom Watch: Validating IPC Structures...
+❌ Server struct analysis failed: Struct 'NonExistentStruct' not found in /home/x/Desktop/venom_memory_rs/venom_audio/include/venom_ipc.h
+Exit code: 1
+x@x-HP-ZBook-15u-G6:~/Desktop/venom_memory_rs/venom-watch$ 
