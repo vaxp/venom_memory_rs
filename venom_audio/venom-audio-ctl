@@ -1,0 +1,37 @@
+#!/bin/bash
+# Venom Audio Helper - Volume Control via D-Bus
+# Usage: venom-audio-ctl up|down|mute
+
+ACTION="$1"
+STEP=5
+
+case "$ACTION" in
+    up)
+        CURRENT=$(gdbus call --session --dest org.venom.Audio --object-path /org/venom/Audio --method org.venom.Audio.GetVolume 2>/dev/null | grep -oP '\d+')
+        if [ -n "$CURRENT" ]; then
+            NEW=$((CURRENT + STEP))
+            [ $NEW -gt 100 ] && NEW=100
+            gdbus call --session --dest org.venom.Audio --object-path /org/venom/Audio --method org.venom.Audio.SetVolume "$NEW" >/dev/null 2>&1
+        fi
+        ;;
+    down)
+        CURRENT=$(gdbus call --session --dest org.venom.Audio --object-path /org/venom/Audio --method org.venom.Audio.GetVolume 2>/dev/null | grep -oP '\d+')
+        if [ -n "$CURRENT" ]; then
+            NEW=$((CURRENT - STEP))
+            [ $NEW -lt 0 ] && NEW=0
+            gdbus call --session --dest org.venom.Audio --object-path /org/venom/Audio --method org.venom.Audio.SetVolume "$NEW" >/dev/null 2>&1
+        fi
+        ;;
+    mute)
+        MUTED=$(gdbus call --session --dest org.venom.Audio --object-path /org/venom/Audio --method org.venom.Audio.GetMuted 2>/dev/null | grep -oP 'true|false')
+        if [ "$MUTED" = "true" ]; then
+            gdbus call --session --dest org.venom.Audio --object-path /org/venom/Audio --method org.venom.Audio.SetMuted false >/dev/null 2>&1
+        else
+            gdbus call --session --dest org.venom.Audio --object-path /org/venom/Audio --method org.venom.Audio.SetMuted true >/dev/null 2>&1
+        fi
+        ;;
+    *)
+        echo "Usage: $0 up|down|mute"
+        exit 1
+        ;;
+esac

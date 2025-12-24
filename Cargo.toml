@@ -1,0 +1,57 @@
+[package]
+name = "venom_memory"
+version = "0.1.0"
+edition = "2021"
+authors = ["VenomMemory Contributors"]
+description = "High-performance lock-free shared memory IPC library"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+rustix = { version = "0.38", features = ["mm", "shm", "fs"] }
+thiserror = "1.0"
+eframe = { version = "0.27", optional = true }
+
+[features]
+default = []
+gui = ["eframe"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[example]]
+name = "daemon"
+path = "examples/daemon.rs"
+
+[[example]]
+name = "shell"
+path = "examples/shell.rs"
+
+[[example]]
+name = "multicore_test"
+path = "examples/multicore_test.rs"
+
+[[example]]
+name = "ultra_test"
+path = "examples/ultra_test.rs"
+
+[[example]]
+name = "system_daemon"
+path = "examples/system_daemon.rs"
+
+[[example]]
+name = "status_bar"
+path = "examples/status_bar.rs"
+
+[[example]]
+name = "gui_monitor"
+path = "examples/gui_monitor.rs"
+required-features = ["gui"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

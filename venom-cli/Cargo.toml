@@ -1,0 +1,15 @@
+[package]
+name = "venom-cli"
+version = "0.2.0"
+edition = "2021"
+description = "Code generator for VenomMemory IPC projects"
+authors = ["Venom Team"]
+
+[[bin]]
+name = "venom"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+inquire = "0.7"
+console = "0.15"
