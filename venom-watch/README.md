@@ -28,6 +28,11 @@
 - **Automated Guardrails**: Returns a non-zero exit code (1) if validation fails, preventing broken ABIs from being merged.
 - **Pipeline Integration**: Perfect for use as a pre-commit hook or as a step in a GitHub Actions workflow.
 
+### 6. IDE-Ready Integration 🔌
+- **Library Modularization**: The core analysis logic is now a standalone Rust library (`lib.rs`).
+- **JSON Data Exchange**: Use the `--json` flag to get machine-readable validation results for easy consumption by custom editors or IDEs.
+
+
 ---
 
 ## 🛠️ Installation

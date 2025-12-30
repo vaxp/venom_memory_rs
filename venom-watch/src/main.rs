@@ -1,21 +1,33 @@
 use clap::Parser;
-use colored::*;
-use std::fs;
+use colored::Colorize;
 use std::path::PathBuf;
-use tree_sitter::{Parser as TSParser, Query, QueryCursor};
-use streaming_iterator::StreamingIterator;
+use venom_watch::{analyze_file, analyze_enum, run_safety_analysis, StructLayout, EnumLayout, ValidationResult, MemoryEventKind};
+use serde_json;
+use std::io;
+use ratatui::{
+    backend::CrosstermBackend,
+    widgets::{Block, Borders, List, ListItem},
+    layout::{Layout, Constraint, Direction},
+    style::{Style, Color, Modifier},
+    Terminal,
+};
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "venom-watch")]
 #[command(about = "🕵️ VenomMemory Structure Validator", long_about = None)]
 struct Cli {
-    /// Path to the server-side file (e.g., C header)
+    /// Path to the server header file (C)
     #[arg(short, long)]
-    server: PathBuf,
+    server: Option<PathBuf>,
 
-    /// Path to the client-side file (e.g., C source)
+    /// Path to the client source file (C or Rust)
     #[arg(short, long)]
-    client: PathBuf,
+    client: Option<PathBuf>,
 
     /// Name of the struct to validate
     #[arg(short = 'n', long)]
@@ -24,467 +36,260 @@ struct Cli {
     /// Name of the enum to validate
     #[arg(short = 'e', long)]
     enum_name: Option<String>,
-}
 
-#[derive(Debug, Clone)]
-struct Field {
-    name: String,
-    type_name: String,
-    size: usize,
-    offset: usize,
-    #[allow(dead_code)]
-    is_array: bool,
-    #[allow(dead_code)]
-    array_len: usize,
-    line: usize,
-    is_pointer: bool,
-}
+    /// Check for memory leaks in a C file
+    #[arg(long)]
+    check_leaks: Option<PathBuf>,
 
-#[derive(Debug)]
-struct StructLayout {
-    #[allow(dead_code)]
-    name: String,
-    fields: Vec<Field>,
-    total_size: usize,
-    #[allow(dead_code)]
-    file_path: String,
-}
+    /// Output results in JSON format
+    #[arg(short, long)]
+    json: bool,
 
-#[derive(Debug, Clone)]
-struct EnumMember {
-    name: String,
-    value: i64,
-    line: usize,
-}
-
-#[derive(Debug)]
-struct EnumLayout {
-    #[allow(dead_code)]
-    name: String,
-    members: Vec<EnumMember>,
-    #[allow(dead_code)]
-    file_path: String,
+    /// Launch interactive TUI for memory lifecycle visualization
+    #[arg(long)]
+    tui: bool,
 }
 
 fn main() {
     let args = Cli::parse();
+    let mut overall_success = true;
 
-    println!("{}", "🕵️ Venom Watch: Validating IPC Structures...".cyan().bold());
-
-    let mut success = true;
-
-    if let Some(ref s_name) = args.struct_name {
-        let server_path = PathBuf::from(&args.server);
-        let client_path = PathBuf::from(&args.client);
-
-        let server_layout = analyze_file(&server_path, s_name, "Server").unwrap_or_else(|e| {
-            eprintln!("{} {}", "❌ Server struct analysis failed:".red(), e);
-            std::process::exit(1);
-        });
-
-        let client_layout = analyze_file(&client_path, s_name, "Client").unwrap_or_else(|e| {
-            eprintln!("{} {}", "❌ Client struct analysis failed:".red(), e);
-            std::process::exit(1);
-        });
-
-        if !compare_layouts(&server_layout, &client_layout) {
-            success = false;
-        }
+    if !args.json {
+        println!("{}", "🕵️ Venom Watch: Advanced Memory Analysis...".cyan().bold());
     }
 
-    if let Some(ref e_name) = args.enum_name {
-        let server_path = PathBuf::from(&args.server);
-        let client_path = PathBuf::from(&args.client);
-
-        let server_enum = analyze_enum(&server_path, e_name).unwrap_or_else(|e| {
-            eprintln!("{} {}", "❌ Server enum analysis failed:".red(), e);
-            std::process::exit(1);
-        });
-
-        let client_enum = analyze_enum(&client_path, e_name).unwrap_or_else(|e| {
-            eprintln!("{} {}", "❌ Client enum analysis failed:".red(), e);
-            std::process::exit(1);
-        });
-
-        if !compare_enums(&server_enum, &client_enum) {
-            success = false;
-        }
-    }
-
-    if args.struct_name.is_none() && args.enum_name.is_none() {
-        eprintln!("{}", "❌ Error: Please specify either --struct-name or --enum-name".red());
-        std::process::exit(1);
-    }
-
-    if !success {
-        std::process::exit(1);
-    }
-}
-
-fn analyze_file(path: &PathBuf, struct_name: &str, _role: &str) -> Result<StructLayout, String> {
-    let code = fs::read_to_string(path).map_err(|e| format!("Could not read file {}: {}", path.display(), e))?;
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    
-    let mut parser = TSParser::new();
-    let is_rust = ext == "rs";
-    let language = if is_rust {
-        tree_sitter_rust::LANGUAGE
-    } else {
-        tree_sitter_c::LANGUAGE
-    };
-    
-    parser.set_language(&language.into()).expect("Error loading grammar");
-
-    let tree = parser.parse(&code, None).expect("Failed to parse code");
-    let root_node = tree.root_node();
-
-    if is_rust {
-        return analyze_rust_struct(struct_name, &code, root_node, path.to_string_lossy().to_string());
-    }
-
-    // Query to find the struct definition
-    let query_str = format!(
-        r#"
-        (struct_specifier
-            name: (type_identifier) @struct_name
-            body: (field_declaration_list) @fields
-        )
-        "#
-    );
-    
-    let query = Query::new(&language.into(), &query_str).expect("Invalid query");
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, root_node, code.as_bytes());
-
-    while let Some(m) = matches.next() {
-        let name_node = m.captures[0].node;
-        let struct_def_name = name_node.utf8_text(code.as_bytes()).unwrap();
-
-        if struct_def_name == struct_name {
-            let fields_node = m.captures[1].node;
-            return parse_fields(fields_node, struct_name, &code, root_node, path.to_string_lossy().to_string());
-        }
-    }
-    
-    // Check for typedef struct
-    let typedef_query_str = format!(
-        r#"
-        (type_definition
-            type: (struct_specifier
-                body: (field_declaration_list) @fields
-            )
-            declarator: (type_identifier) @typedef_name
-        )
-        "#
-    );
-    let td_query = Query::new(&language.into(), &typedef_query_str).expect("Invalid typedef query");
-    let mut td_cursor = QueryCursor::new();
-    let mut td_matches = td_cursor.matches(&td_query, root_node, code.as_bytes());
-
-    while let Some(m) = td_matches.next() {
-        let name_node = m.captures[1].node;
-        let type_name = name_node.utf8_text(code.as_bytes()).unwrap();
-
-        if type_name == struct_name {
-             let fields_node = m.captures[0].node;
-             return parse_fields(fields_node, struct_name, &code, root_node, path.to_string_lossy().to_string());
-        }
-    }
-
-    Err(format!("Struct '{}' not found in {}", struct_name, path.display()))
-}
-
-fn parse_fields(fields_list_node: tree_sitter::Node, struct_name: &str, code: &str, root_node: tree_sitter::Node, file_path: String) -> Result<StructLayout, String> {
-    let mut fields = Vec::new();
-    let mut current_offset = 0;
-    
-    let mut cursor = fields_list_node.walk();
-    for child in fields_list_node.children(&mut cursor) {
-        if child.kind() == "field_declaration" {
-             let type_node = child.child_by_field_name("type").ok_or("No type")?;
-             let decl_node = child.child_by_field_name("declarator").ok_or("No declarator")?;
-             
-             let type_text = type_node.utf8_text(code.as_bytes()).unwrap();
-             
-             let (name, is_array, array_len) = if decl_node.kind() == "array_declarator" {
-                 let inner_decl = decl_node.child_by_field_name("declarator").unwrap();
-                 let size_node = decl_node.child_by_field_name("size").unwrap();
-                 let size_str = size_node.utf8_text(code.as_bytes()).unwrap();
-                 let len = parse_array_size(size_str);
-                 let actual_name = if inner_decl.kind() == "pointer_declarator" {
-                     inner_decl.child_by_field_name("declarator").unwrap().utf8_text(code.as_bytes()).unwrap()
-                 } else {
-                     inner_decl.utf8_text(code.as_bytes()).unwrap()
-                 };
-                 (actual_name, true, len)
-             } else if decl_node.kind() == "pointer_declarator" {
-                 (decl_node.child_by_field_name("declarator").unwrap().utf8_text(code.as_bytes()).unwrap(), false, 1)
-             } else {
-                 (decl_node.utf8_text(code.as_bytes()).unwrap(), false, 1)
-             };
-
-             let is_pointer = type_text.contains('*') || decl_node.kind() == "pointer_declarator";
-             let size = if is_pointer { 8 } else { get_type_size(type_text, code, root_node) } * array_len;
-             let align = if is_pointer { 8 } else { get_type_alignment(type_text, code, root_node) };
-             
-             let padding = (align - (current_offset % align)) % align;
-             current_offset += padding;
-
-             // Extract line number
-             let start_pos = decl_node.start_position();
-             let line = start_pos.row + 1;
-
-             fields.push(Field {
-                 name: name.to_string(),
-                 type_name: type_text.to_string(),
-                 size,
-                 offset: current_offset,
-                 is_array,
-                 array_len,
-                 line,
-                 is_pointer,
-             });
-
-             current_offset += size;
-        }
-    }
-    
-    let max_align = fields.iter().map(|f| {
-        let is_ptr = f.type_name.contains('*') || f.is_pointer;
-        if is_ptr { 8 } else { get_type_alignment(&f.type_name, code, root_node) }
-    }).max().unwrap_or(1);
-    let padding = (max_align - (current_offset % max_align)) % max_align;
-    current_offset += padding;
-
-    Ok(StructLayout {
-        name: struct_name.to_string(),
-        fields,
-        total_size: current_offset,
-        file_path,
-    })
-}
-
-fn analyze_rust_struct(struct_name: &str, code: &str, root_node: tree_sitter::Node, file_path: String) -> Result<StructLayout, String> {
-    let language = tree_sitter_rust::LANGUAGE;
-    // Find struct with potential #[repr(C)]
-    let query_str = format!(
-        r#"
-        (struct_item
-            name: (type_identifier) @name
-            body: (field_declaration_list) @fields
-        ) @item
-        "#
-    );
-    
-    let query = Query::new(&language.into(), &query_str).expect("Invalid query");
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, root_node, code.as_bytes());
-
-    while let Some(m) = matches.next() {
-        let name_node = m.captures[1].node;
-        let r_struct_name = name_node.utf8_text(code.as_bytes()).unwrap();
-
-        if r_struct_name == struct_name {
-            let fields_node = m.captures[2].node;
-            return parse_rust_fields(fields_node, struct_name, code, root_node, file_path);
-        }
-    }
-    
-    Err(format!("Rust struct '{}' not found", struct_name))
-}
-
-fn parse_rust_fields(fields_list_node: tree_sitter::Node, struct_name: &str, code: &str, root_node: tree_sitter::Node, file_path: String) -> Result<StructLayout, String> {
-    let mut fields = Vec::new();
-    let mut current_offset = 0;
-    
-    let mut cursor = fields_list_node.walk();
-    for child in fields_list_node.children(&mut cursor) {
-        if child.kind() == "field_declaration" {
-             let type_node = child.child_by_field_name("type").ok_or("No type")?;
-             let name_node = child.child_by_field_name("name").ok_or("No name")?;
-             
-             let name = name_node.utf8_text(code.as_bytes()).unwrap();
-             let type_text = type_node.utf8_text(code.as_bytes()).unwrap();
-             
-             let (size, align, is_array, array_len) = get_rust_type_info(type_text, code, root_node);
-             
-             let padding = (align - (current_offset % align)) % align;
-             current_offset += padding;
-
-             fields.push(Field {
-                 name: name.to_string(),
-                 type_name: type_text.to_string(),
-                 size,
-                 offset: current_offset,
-                 is_array,
-                 array_len,
-                 line: name_node.start_position().row + 1,
-                 is_pointer: type_text.contains('*') || type_text.starts_with('&'),
-             });
-
-             current_offset += size;
-        }
-    }
-    
-    let max_align = fields.iter().map(|f| {
-        let (_, align, _, _) = get_rust_type_info(&f.type_name, code, root_node);
-        align
-    }).max().unwrap_or(1);
-    let padding = (max_align - (current_offset % max_align)) % max_align;
-    current_offset += padding;
-
-    Ok(StructLayout {
-        name: struct_name.to_string(),
-        fields,
-        total_size: current_offset,
-        file_path,
-    })
-}
-
-fn get_rust_type_info(t: &str, code: &str, root_node: tree_sitter::Node) -> (usize, usize, bool, usize) {
-    let t = t.trim();
-    // Handle arrays [T; N]
-    if t.starts_with('[') && t.contains(';') {
-        let inner = &t[1..t.len()-1];
-        let parts: Vec<&str> = inner.split(';').collect();
-        if parts.len() == 2 {
-            let inner_type = parts[0].trim();
-            let size_str = parts[1].trim();
-            let len = size_str.parse::<usize>().unwrap_or(1);
-            let (inner_size, inner_align, _, _) = get_rust_type_info(inner_type, code, root_node);
-            return (inner_size * len, inner_align, true, len);
-        }
-    }
-
-    let (size, align) = match t {
-        "u8" | "i8" | "bool" => (1, 1),
-        "u16" | "i16" => (2, 2),
-        "u32" | "i32" | "f32" => (4, 4),
-        "u64" | "i64" | "f64" | "usize" | "isize" => (8, 8),
-        _ if t.starts_with('&') || t.contains('*') => (8, 8),
-        _ => (4, 4), // Fallback
-    };
-    
-    (size, align, false, 1)
-}
-
-fn parse_array_size(s: &str) -> usize {
-    if let Ok(n) = s.parse::<usize>() {
-        return n;
-    }
-    // Heuristic for macros
-    match s {
-        "MAX_DEVICE_NAME" => 128,
-        "MAX_DEVICES" => 16,
-        "MAX_APP_STREAMS" => 32,
-        _ => 1,
-    }
-}
-
-fn get_type_size(t: &str, code: &str, root_node: tree_sitter::Node) -> usize {
-    match t {
-        "char" | "int8_t" | "uint8_t" => 1,
-        "short" | "int16_t" | "uint16_t" => 2,
-        "int" | "int32_t" | "uint32_t" | "float" | "gint" | "guint32" | "gboolean" => 4,
-        "long" | "int64_t" | "uint64_t" | "double" | "size_t" | "guint64" | "uintptr_t" => 8,
-        _ => {
-            if t.ends_with('*') { 
-                8 
-            } else {
-                if let Ok(layout) = find_and_parse_struct(t, code, root_node) {
-                    layout.total_size
-                } else {
-                    4 
+    // 1. Structure/Enum Validation
+    if let (Some(server_path), Some(client_path)) = (&args.server, &args.client) {
+        if let Some(struct_name) = &args.struct_name {
+            match analyze_file(server_path, struct_name) {
+                Ok(server_layout) => {
+                    match analyze_file(client_path, struct_name) {
+                        Ok(client_layout) => {
+                            if !compare_layouts(&server_layout, &client_layout, args.json) {
+                                overall_success = false;
+                            }
+                        }
+                        Err(e) => {
+                            if !args.json { println!("{} {}", "Error:".red(), e); }
+                            overall_success = false;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !args.json { println!("{} {}", "Error:".red(), e); }
+                    overall_success = false;
+                }
+            }
+        } else if let Some(enum_name) = &args.enum_name {
+            match analyze_enum(server_path, enum_name) {
+                Ok(server_layout) => {
+                    match analyze_enum(client_path, enum_name) {
+                        Ok(client_layout) => {
+                            if !compare_enums(&server_layout, &client_layout, args.json) {
+                                overall_success = false;
+                            }
+                        }
+                        Err(e) => {
+                            if !args.json { println!("{} {}", "Error:".red(), e); }
+                            overall_success = false;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !args.json { println!("{} {}", "Error:".red(), e); }
+                    overall_success = false;
                 }
             }
         }
     }
-}
 
-fn find_and_parse_struct(struct_name: &str, code: &str, root_node: tree_sitter::Node) -> Result<StructLayout, String> {
-    let query_str = format!(
-        r#"
-        (struct_specifier
-            name: (type_identifier) @struct_name
-            body: (field_declaration_list) @fields
-        )
-        "#
-    );
-    let language = tree_sitter_c::LANGUAGE;
-    let query = Query::new(&language.into(), &query_str).unwrap();
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, root_node, code.as_bytes());
-
-    while let Some(m) = matches.next() {
-        let name_node = m.captures[0].node;
-        let name = name_node.utf8_text(code.as_bytes()).unwrap();
-        if name == struct_name {
-            return parse_fields(m.captures[1].node, struct_name, code, root_node, "nested".to_string());
-        }
-    }
-
-    let typedef_query_str = format!(
-        r#"
-        (type_definition
-            type: (struct_specifier
-                body: (field_declaration_list) @fields
-            )
-            declarator: (type_identifier) @typedef_name
-        )
-        "#
-    );
-    let td_query = Query::new(&language.into(), &typedef_query_str).unwrap();
-    let mut td_cursor = QueryCursor::new();
-    let mut td_matches = td_cursor.matches(&td_query, root_node, code.as_bytes());
-
-    while let Some(m) = td_matches.next() {
-        let name_node = m.captures[1].node;
-        let name = name_node.utf8_text(code.as_bytes()).unwrap();
-        if name == struct_name {
-             return parse_fields(m.captures[0].node, struct_name, code, root_node, "nested".to_string());
-        }
-    }
-
-    Err("Struct not found".to_string())
-}
-
-fn get_type_alignment(t: &str, code: &str, root_node: tree_sitter::Node) -> usize {
-    match t {
-        "char" | "int8_t" | "uint8_t" => 1,
-        "short" | "int16_t" | "uint16_t" => 2,
-        "int" | "int32_t" | "uint32_t" | "float" | "gint" | "guint32" | "gboolean" => 4,
-        "long" | "int64_t" | "uint64_t" | "double" | "size_t" | "guint64" | "uintptr_t" => 8,
-        _ => {
-            if let Ok(layout) = find_and_parse_struct(t, code, root_node) {
-                layout.fields.iter().map(|f| {
-                    let is_ptr = f.type_name.contains('*') || f.is_pointer;
-                    if is_ptr { 8 } else { get_type_alignment(&f.type_name, code, root_node) }
-                }).max().unwrap_or(1)
-            } else {
-                1
+    // 2. Leak Detection
+    if let Some(leak_path) = &args.check_leaks {
+        match run_safety_analysis(leak_path) {
+            Ok(report) => {
+                if args.tui {
+                    if let Err(e) = run_tui(&report) {
+                        eprintln!("TUI Error: {}", e);
+                    }
+                } else if args.json {
+                    // JSON mode handles its own output for leaks too if needed, 
+                    // but usually we want a combined JSON.
+                    // For now, let's keep it simple: if leaks are requested, print leak report.
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                } else {
+                    println!("\n{}", "🔍 Memory Leak Report:".bold());
+                    println!("{}", "--------------------------------------------------".dimmed());
+                    if report.success {
+                        println!("{}", "✅ No obvious leaks detected in local scopes.".green());
+                    } else {
+                        for finding in &report.findings {
+                            println!("❌ {}", finding.red());
+                        }
+                    }
+                }
+                if !report.success { overall_success = false; }
+            }
+            Err(e) => {
+                if !args.json { println!("{} {}", "Error:".red(), e); }
+                overall_success = false;
             }
         }
     }
+
+    if !overall_success {
+        std::process::exit(1);
+    }
 }
 
-fn compare_layouts(server: &StructLayout, client: &StructLayout) -> bool {
-    println!("\n{}: {} bytes", "Server Struct".green(), server.total_size);
-    println!("{}: {} bytes", "Client Struct".yellow(), client.total_size);
-    println!("--------------------------------------------------");
+fn run_tui(report: &venom_watch::LeakReport) -> Result<(), io::Error> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
+    let code_content = std::fs::read_to_string(&report.file_path).unwrap_or_default();
+    let lines: Vec<&str> = code_content.lines().collect();
+    
+    let mut scroll = 0;
+
+    loop {
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
+                .split(f.size());
+
+            // 1. Code View
+            let mut code_items = Vec::new();
+            for (i, line) in lines.iter().enumerate().skip(scroll) {
+                let line_num = i + 1;
+                let mut style = Style::default();
+                let mut prefix = format!("{:>3} | ", line_num);
+                
+                // Overlay markers
+                for event in &report.events {
+                    if event.line == line_num {
+                        match event.kind {
+                            MemoryEventKind::Allocation => {
+                                prefix = format!("🟢 {:>1} | ", "A");
+                                style = style.fg(Color::Green);
+                            }
+                            MemoryEventKind::Free => {
+                                prefix = format!("🔴 {:>1} | ", "F");
+                                style = style.fg(Color::Red);
+                            }
+                            MemoryEventKind::PotentialMove => {
+                                prefix = format!("🟡 {:>1} | ", "M");
+                                style = style.fg(Color::Yellow);
+                            }
+                            MemoryEventKind::ExplicitMove => {
+                                prefix = format!("🔵 {:>1} | ", "E");
+                                style = style.fg(Color::Blue);
+                            }
+                            MemoryEventKind::ConditionalFree => {
+                                prefix = format!("🟧 {:>1} | ", "C");
+                                style = style.fg(Color::Rgb(255, 165, 0));
+                            }
+                            MemoryEventKind::UseAfterFree => {
+                                prefix = format!("💀 {:>1} | ", "U");
+                                style = style.fg(Color::Magenta);
+                            }
+                            MemoryEventKind::DoubleFree => {
+                                prefix = format!("🚫 {:>1} | ", "D");
+                                style = style.fg(Color::LightRed);
+                            }
+                            MemoryEventKind::BufferOverflow => {
+                                prefix = format!("⚠️  {:>1} | ", "O");
+                                style = style.fg(Color::LightRed).add_modifier(Modifier::BOLD);
+                            }
+                        }
+                    }
+                }
+
+                code_items.push(ListItem::new(format!("{}{}", prefix, line)).style(style));
+            }
+            let code_list = List::new(code_items)
+                .block(Block::default().borders(Borders::ALL).title(format!(" Source: {} ", report.file_path)));
+            f.render_widget(code_list, chunks[0]);
+
+            // 2. Status Panel
+            let mut status_text = vec![
+                ListItem::new(" LEYEND:").style(Style::default().add_modifier(Modifier::BOLD)),
+                ListItem::new(" 🟢 A: Allocation").style(Style::default().fg(Color::Green)),
+                ListItem::new(" 🔴 F: Free").style(Style::default().fg(Color::Red)),
+                ListItem::new(" 🟡 M: Potential Move").style(Style::default().fg(Color::Yellow)),
+                ListItem::new(" 🔵 E: Explicit Move").style(Style::default().fg(Color::Blue)),
+                ListItem::new(" 🟧 C: Conditional Free").style(Style::default().fg(Color::Rgb(255, 165, 0))),
+                ListItem::new(" 💀 U: Use-After-Free").style(Style::default().fg(Color::Magenta)),
+                ListItem::new(" 🚫 D: Double Free").style(Style::default().fg(Color::LightRed)),
+                ListItem::new(" ⚠️  O: Buffer Overflow").style(Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+                ListItem::new(""),
+                ListItem::new(" FINDINGS:").style(Style::default().add_modifier(Modifier::BOLD)),
+            ];
+
+            if report.findings.is_empty() {
+                status_text.push(ListItem::new(" ✅ No leaks!").style(Style::default().fg(Color::Green)));
+            } else {
+                for finding in &report.findings {
+                    status_text.push(ListItem::new(format!(" ❌ {}", finding)).style(Style::default().fg(Color::Red)));
+                }
+            }
+
+            status_text.push(ListItem::new(""));
+            status_text.push(ListItem::new(" (Press 'q' to exit, arrows to scroll)"));
+
+            let status_list = List::new(status_text)
+                .block(Block::default().borders(Borders::ALL).title(" Memory Lifecycle "));
+            f.render_widget(status_list, chunks[1]);
+        })?;
+
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Up => {
+                        if scroll > 0 { scroll -= 1; }
+                    }
+                    KeyCode::Down => {
+                        if scroll < lines.len() - 1 { scroll += 1; }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    Ok(())
+}
+
+fn compare_layouts(server: &StructLayout, client: &StructLayout, json_mode: bool) -> bool {
     let mut all_match = true;
+    let mut issues = Vec::new();
 
     if server.total_size != client.total_size {
-        println!("{}", "⚠️  SIZE MISMATCH IDENTIFIED!".red().bold());
-        println!("Expected: {} bytes", server.total_size);
-        println!("Found:    {} bytes", client.total_size);
         all_match = false;
-    } else {
-        println!("{}", "✅ Total sizes match.".green());
+        issues.push(format!("Size mismatch: Server={} bytes, Client={} bytes", server.total_size, client.total_size));
     }
-    
-    println!("\n{:<20} | {:<16} | {:<16} | {:<30}", "Field", "Server (Line)", "Client (Line)", "Status");
-    println!("{}", "-".repeat(90));
+
+    if !json_mode {
+        println!("\n{} {}", "Validating Structure:".bold(), server.name.blue());
+        println!("{}: {} bytes", "Server Struct".green(), server.total_size);
+        println!("{}: {} bytes", "Client Struct".yellow(), client.total_size);
+        println!("--------------------------------------------------");
+        if all_match { println!("{}", "✅ Total sizes match.".green()); }
+        else { println!("{}", "⚠️  SIZE MISMATCH IDENTIFIED!".red().bold()); }
+        println!("\n{:<20} | {:<16} | {:<16} | {:<30}", "Field", "Server (Line)", "Client (Line)", "Status");
+        println!("{}", "-".repeat(90));
+    }
 
     let mut s_idx = 0;
     let mut c_idx = 0;
@@ -501,12 +306,21 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) -> bool {
                 let s_pad = server.total_size - s_current_offset;
                 let c_pad = client.total_size - c_current_offset;
                 if s_pad > 0 || c_pad > 0 {
-                    println!("{:<20} | {:<16} | {:<16} | {}", 
-                        "[TRAILING PAD]".cyan().dimmed(),
-                        if s_pad > 0 { format!("{} bytes", s_pad).cyan() } else { "N/A".into() },
-                        if c_pad > 0 { format!("{} bytes", c_pad).cyan() } else { "N/A".into() },
-                        if s_pad == c_pad { "✅ OK".green() } else { "⚠️  Mismatch".yellow() }
-                    );
+                    if !json_mode {
+                        println!("{:<20} | {:<16} | {:<16} | {}", 
+                            "[TRAILING PAD]".cyan().dimmed(),
+                            if s_pad > 0 { format!("{} bytes", s_pad).cyan() } else { "N/A".into() },
+                            if c_pad > 0 { format!("{} bytes", c_pad).cyan() } else { "N/A".into() },
+                            if s_pad == c_pad { "✅ OK".green() } else { "⚠️  Mismatch".yellow() }
+                        );
+                    } else {
+                        if s_pad != c_pad {
+                            issues.push(format!("Trailing padding mismatch: Server={} bytes, Client={} bytes", s_pad, c_pad));
+                            all_match = false;
+                        } else if s_pad > 0 {
+                            issues.push(format!("Info: Trailing padding detected ({} bytes)", s_pad));
+                        }
+                    }
                 }
             }
             break;
@@ -516,12 +330,16 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) -> bool {
         if let Some(s) = s_field {
             if s.offset > s_current_offset {
                 let pad = s.offset - s_current_offset;
-                println!("{:<20} | {:<16} | {:<16} | {}", 
-                    "[PADDING]".cyan().dimmed(),
-                    format!("{} bytes", pad).cyan(),
-                    "",
-                    "INTERNAL".dimmed()
-                );
+                if !json_mode {
+                    println!("{:<20} | {:<16} | {:<16} | {}", 
+                        "[PADDING]".cyan().dimmed(),
+                        format!("{} bytes", pad).cyan(),
+                        "",
+                        "INTERNAL".dimmed()
+                    );
+                } else {
+                    issues.push(format!("Info: Internal padding in server before {} ({} bytes)", s.name, pad));
+                }
                 s_current_offset = s.offset;
             }
         }
@@ -530,44 +348,56 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) -> bool {
         if let Some(c) = c_field {
             if c.offset > c_current_offset {
                 let pad = c.offset - c_current_offset;
-                println!("{:<20} | {:<16} | {:<16} | {}", 
-                    "[PADDING]".cyan().dimmed(),
-                    "",
-                    format!("{} bytes", pad).cyan(),
-                    "INTERNAL".dimmed()
-                );
+                if !json_mode {
+                    println!("{:<20} | {:<16} | {:<16} | {}", 
+                        "[PADDING]".cyan().dimmed(),
+                        "",
+                        format!("{} bytes", pad).cyan(),
+                        "INTERNAL".dimmed()
+                    );
+                } else {
+                    issues.push(format!("Info: Internal padding in client before {} ({} bytes)", c.name, pad));
+                }
                 c_current_offset = c.offset;
             }
         }
 
         match (s_field, c_field) {
             (Some(s), Some(c)) => {
+                let mut status_issues = Vec::new();
                 let status = if s.offset != c.offset {
                     all_match = false;
+                    status_issues.push("Offset Mismatch".to_string());
                     "❌ Offset Mismatch".red()
                 } else if s.size != c.size {
                     all_match = false;
+                    status_issues.push("Size Mismatch".to_string());
                     "❌ Size Mismatch".red()
                 } else if s.name != c.name {
+                    status_issues.push("Name Diff".to_string());
                      "⚠️ Name Diff".yellow()
                 } else {
                      "✅ OK".green()
                 };
 
-                let mut status_str = status.to_string();
                 if s.is_pointer || c.is_pointer {
-                    status_str = format!("{} | {}", status_str, "🚨 POINTER DANGER!".on_red().white().bold());
+                    status_issues.push("🚨 POINTER DANGER!".to_string());
+                }
+
+                if !json_mode {
+                    let mut status_str = status.to_string();
+                    if s.is_pointer || c.is_pointer {
+                        status_str = format!("{} | {}", status_str, "🚨 POINTER DANGER!".on_red().white().bold());
+                    }
+                    let s_info = format!("@{: <4} (L{})", s.offset, s.line);
+                    let c_info = format!("@{: <4} (L{})", c.offset, c.line);
+                    println!("{:<20} | {:<16} | {:<16} | {}", s.name.chars().take(20).collect::<String>(), s_info, c_info, status_str);
                 }
                 
-                let s_info = format!("@{: <4} (L{})", s.offset, s.line);
-                let c_info = format!("@{: <4} (L{})", c.offset, c.line);
-                
-                println!("{:<20} | {:<16} | {:<16} | {}", 
-                    s.name.chars().take(20).collect::<String>(), 
-                    s_info, 
-                    c_info, 
-                    status_str
-                );
+                if !status_issues.is_empty() {
+                    issues.push(format!("Field {}: {}", s.name, status_issues.join(", ")));
+                }
+
                 s_current_offset = s.offset + s.size;
                 c_current_offset = c.offset + c.size;
                 s_idx += 1;
@@ -575,178 +405,91 @@ fn compare_layouts(server: &StructLayout, client: &StructLayout) -> bool {
             },
             (Some(s), None) => {
                  all_match = false;
-                 let mut status_str = "❌ Missing in Client".red().to_string();
-                 if s.is_pointer {
-                     status_str = format!("{} | {}", status_str, "🚨 POINTER DANGER!".on_red().white().bold());
+                 issues.push(format!("Field {} missing in client", s.name));
+                 if !json_mode {
+                     let s_info = format!("@{: <4} (L{})", s.offset, s.line);
+                     println!("{:<20} | {:<16} | {:<16} | {}", s.name, s_info, "MISSING", "❌ Missing in Client".red());
                  }
-                 let s_info = format!("@{: <4} (L{})", s.offset, s.line);
-                 println!("{:<20} | {:<16} | {:<16} | {}", s.name, s_info, "MISSING", status_str);
                  s_current_offset = s.offset + s.size;
                  s_idx += 1;
             },
             (None, Some(c)) => {
                  all_match = false;
-                 let mut status_str = "❌ Extra in Client".red().to_string();
-                 if c.is_pointer {
-                     status_str = format!("{} | {}", status_str, "🚨 POINTER DANGER!".on_red().white().bold());
+                 issues.push(format!("Field {} extra in client", c.name));
+                 if !json_mode {
+                     let c_info = format!("@{: <4} (L{})", c.offset, c.line);
+                     println!("{:<20} | {:<16} | {:<16} | {}", c.name, "MISSING", c_info, "❌ Extra in Client".red());
                  }
-                 let c_info = format!("@{: <4} (L{})", c.offset, c.line);
-                 println!("{:<20} | {:<16} | {:<16} | {}", c.name, "MISSING", c_info, status_str);
                  c_current_offset = c.offset + c.size;
                  c_idx += 1;
             },
             _ => unreachable!(),
         }
     }
+
+    if json_mode {
+        let result = ValidationResult {
+            success: all_match,
+            server_size: server.total_size,
+            client_size: client.total_size,
+            issues,
+        };
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    }
+
     all_match
 }
 
-// -----------------------------------------------------------------------------
-// Enum Validation Logic
-// -----------------------------------------------------------------------------
-
-fn analyze_enum(path: &PathBuf, enum_name: &str) -> Result<EnumLayout, String> {
-    let code = fs::read_to_string(path).map_err(|e| format!("Could not read file {}: {}", path.display(), e))?;
-    
-    let mut parser = TSParser::new();
-    let language = tree_sitter_c::LANGUAGE;
-    parser.set_language(&language.into()).expect("Error loading C grammar");
-
-    let tree = parser.parse(&code, None).expect("Failed to parse code");
-    let root_node = tree.root_node();
-
-    // Query for named enums: enum Name { ... }
-    let query_str = r#"
-        (enum_specifier
-            name: (type_identifier) @name
-            body: (enumerator_list) @list
-        )
-    "#;
-    let query = Query::new(&language.into(), query_str).unwrap();
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, root_node, code.as_bytes());
-
-    while let Some(m) = matches.next() {
-        let name = m.captures[0].node.utf8_text(code.as_bytes()).unwrap();
-        if name == enum_name {
-            return parse_enum_list(m.captures[1].node, enum_name, &code, path.to_string_lossy().to_string());
-        }
-    }
-
-    // Query for typedef enums: typedef enum { ... } Name;
-    let td_query_str = r#"
-        (type_definition
-            type: (enum_specifier
-                body: (enumerator_list) @list
-            )
-            declarator: (type_identifier) @name
-        )
-    "#;
-    let td_query = Query::new(&language.into(), td_query_str).unwrap();
-    let mut td_cursor = QueryCursor::new();
-    let mut td_matches = td_cursor.matches(&td_query, root_node, code.as_bytes());
-
-    while let Some(m) = td_matches.next() {
-        let name = m.captures[1].node.utf8_text(code.as_bytes()).unwrap();
-        if name == enum_name {
-            return parse_enum_list(m.captures[0].node, enum_name, &code, path.to_string_lossy().to_string());
-        }
-    }
-
-    Err(format!("Enum '{}' not found in {}", enum_name, path.display()))
-}
-
-fn parse_enum_list(list_node: tree_sitter::Node, name: &str, code: &str, path: String) -> Result<EnumLayout, String> {
-    let mut members = Vec::new();
-    let mut current_value = 0;
-
-    let mut cursor = list_node.walk();
-    for child in list_node.children(&mut cursor) {
-        if child.kind() == "enumerator" {
-            let name_node = child.child_by_field_name("name").unwrap();
-            let member_name = name_node.utf8_text(code.as_bytes()).unwrap();
-            
-            if let Some(value_node) = child.child_by_field_name("value") {
-                let value_text = value_node.utf8_text(code.as_bytes()).unwrap();
-                // Basic parsing for integers, hex, etc.
-                let val = if value_text.starts_with("0x") {
-                    i64::from_str_radix(&value_text[2..], 16).unwrap_or(current_value)
-                } else {
-                    value_text.parse::<i64>().unwrap_or(current_value)
-                };
-                current_value = val;
-            }
-
-            members.push(EnumMember {
-                name: member_name.to_string(),
-                value: current_value,
-                line: name_node.start_position().row + 1,
-            });
-
-            current_value += 1;
-        }
-    }
-
-    Ok(EnumLayout {
-        name: name.to_string(),
-        members,
-        file_path: path,
-    })
-}
-
-fn compare_enums(server: &EnumLayout, client: &EnumLayout) -> bool {
-    println!("\n{}: {} members", "Server Enum".green(), server.members.len());
-    println!("{}: {} members", "Client Enum".yellow(), client.members.len());
-    println!("--------------------------------------------------");
-
+fn compare_enums(server: &EnumLayout, client: &EnumLayout, json_mode: bool) -> bool {
     let mut all_match = true;
-    
-    println!("{:<25} | {:<15} | {:<15} | {:<20}", "Member", "Server (Val)", "Client (Val)", "Status");
-    println!("{}", "-".repeat(80));
+    let mut issues = Vec::new();
 
-    // Create a map for client members for easy lookup
+    if !json_mode {
+        println!("\n{}: {} members", "Server Enum".green(), server.members.len());
+        println!("{}: {} members", "Client Enum".yellow(), client.members.len());
+        println!("--------------------------------------------------");
+        println!("{:<25} | {:<15} | {:<15} | {:<20}", "Member", "Server (Val)", "Client (Val)", "Status");
+        println!("{}", "-".repeat(80));
+    }
+
     use std::collections::HashMap;
-    let client_members: HashMap<String, &EnumMember> = client.members.iter().map(|m| (m.name.clone(), m)).collect();
+    let client_members: HashMap<String, &venom_watch::EnumMember> = client.members.iter().map(|m| (m.name.clone(), m)).collect();
 
     for s in &server.members {
         let c = client_members.get(&s.name);
-
         match c {
             Some(c_member) => {
-                let status = if s.value == c_member.value {
-                    "✅ OK".green()
-                } else {
+                let matches = s.value == c_member.value;
+                if !matches {
                     all_match = false;
-                    format!("❌ Mismatch (@L{})", c_member.line).red()
-                };
-
-                println!("{:<25} | {:<15} | {:<15} | {}", 
-                    s.name, 
-                    format!("{} (L{})", s.value, s.line),
-                    format!("{} (L{})", c_member.value, c_member.line),
-                    status
-                );
+                    issues.push(format!("Enum member {} mismatch: Server={}, Client={}", s.name, s.value, c_member.value));
+                }
+                if !json_mode {
+                    let status = if matches { "✅ OK".green() } else { format!("❌ Mismatch (@L{})", c_member.line).red() };
+                    println!("{:<25} | {:<15} | {:<15} | {}", s.name, format!("{} (L{})", s.value, s.line), format!("{} (L{})", c_member.value, c_member.line), status);
+                }
             }
             None => {
                 all_match = false;
-                println!("{:<25} | {:<15} | {:<15} | {}", s.name, s.value, "MISSING", "❌ Missing in Client".red());
+                issues.push(format!("Enum member {} missing in client", s.name));
+                if !json_mode {
+                    println!("{:<25} | {:<15} | {:<15} | {}", s.name, s.value, "MISSING", "❌ Missing in Client".red());
+                }
             }
         }
     }
 
-    // Check for extra members in client
-    let server_names: Vec<String> = server.members.iter().map(|m| m.name.clone()).collect();
-    for c in &client.members {
-        if !server_names.contains(&c.name) {
-            all_match = false;
-            println!("{:<25} | {:<15} | {:<15} | {}", c.name, "MISSING", c.value, "❌ Extra in Client".red());
-        }
-    }
-
-    if all_match {
-        println!("\n{}", "✅ Enums are fully consistent!".green().bold());
+    if json_mode {
+        let result = ValidationResult {
+            success: all_match,
+            server_size: 0,
+            client_size: 0,
+            issues,
+        };
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
     } else {
-        println!("\n{}", "⚠️  ENUM INCONSISTENCY DETECTED!".red().bold());
+        if all_match { println!("\n{}", "✅ Enums are fully consistent!".green().bold()); }
+        else { println!("\n{}", "⚠️  ENUM INCONSISTENCY DETECTED!".red().bold()); }
     }
     all_match
 }
