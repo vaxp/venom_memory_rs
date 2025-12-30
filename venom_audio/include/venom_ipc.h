@@ -30,6 +30,7 @@ typedef struct {
     char icon[64];
     int32_t volume;
     uint8_t muted;
+    char sink[MAX_DEVICE_NAME];
     uint8_t _pad[3];
 } VenomAppStream;
 

@@ -58,6 +58,7 @@ typedef struct {
     char icon[64];
     int32_t volume;
     uint8_t muted;
+    char sink[MAX_DEVICE_NAME];
     uint8_t _pad[3];
 } VenomAppStream;
 
@@ -197,6 +198,7 @@ static void venom_update_apps(void) {
         strncpy(va->icon, a->icon ? a->icon : "", 63);
         va->volume = a->volume;
         va->muted = a->muted;
+        strncpy(va->sink, a->sink_name ? a->sink_name : "", MAX_DEVICE_NAME - 1);
         shared_state.app_count++;
         audio_app_stream_free(a);
     }

@@ -49,6 +49,7 @@ typedef struct {
     char icon[64];
     int32_t volume;
     uint8_t muted;
+    char sink[MAX_DEVICE_NAME];
     uint8_t _pad[3];
 } VenomAppStream;
 
@@ -129,6 +130,9 @@ static GtkWidget* g_sinks_combo = NULL;
 static GtkWidget* g_apps_box = NULL;
 static GtkWidget* g_update_label = NULL;
 
+static GtkWidget* g_sources_combo = NULL;
+static GtkWidget* g_overamp_check = NULL;
+
 static gboolean g_updating_ui = FALSE;
 static struct timespec g_last_cmd_sent = {0};
 
@@ -182,6 +186,34 @@ static void send_default_sink_command(const char* name) {
     strncpy(cmd.data.device.name, name, MAX_DEVICE_NAME - 1);
     venom_shell_send_command(g_shell, (uint8_t*)&cmd, sizeof(cmd));
     g_print("📤 Sent default sink command: %s\n", name);
+}
+
+static void send_default_source_command(const char* name) {
+    if (!g_shell || !name) return;
+    VenomAudioCommand cmd = {0};
+    cmd.cmd = CMD_SET_DEFAULT_SOURCE;
+    strncpy(cmd.data.device.name, name, MAX_DEVICE_NAME - 1);
+    venom_shell_send_command(g_shell, (uint8_t*)&cmd, sizeof(cmd));
+    g_print("📤 Sent default source command: %s\n", name);
+}
+
+static void send_overamp_command(gboolean enabled) {
+    if (!g_shell) return;
+    VenomAudioCommand cmd = {0};
+    cmd.cmd = CMD_SET_OVERAMPLIFICATION;
+    cmd.data.enabled = enabled;
+    venom_shell_send_command(g_shell, (uint8_t*)&cmd, sizeof(cmd));
+    g_print("📤 Sent overamplification command: %d\n", enabled);
+}
+
+static void send_move_app_command(uint32_t index, const char* sink_name) {
+    if (!g_shell || !sink_name) return;
+    VenomAudioCommand cmd = {0};
+    cmd.cmd = CMD_MOVE_APP_TO_SINK;
+    cmd.data.app_sink.index = index;
+    strncpy(cmd.data.app_sink.sink, sink_name, MAX_DEVICE_NAME - 1);
+    venom_shell_send_command(g_shell, (uint8_t*)&cmd, sizeof(cmd));
+    g_print("📤 Sent move app command: %u -> %s\n", index, sink_name);
 }
 
 static void send_app_volume_command(uint32_t index, int volume) {
@@ -259,6 +291,35 @@ static void on_sink_changed(GtkComboBox* combo, gpointer data) {
     }
 }
 
+static void on_source_changed(GtkComboBox* combo, gpointer data) {
+    (void)data;
+    if (g_updating_ui) return;
+    
+    int index = gtk_combo_box_get_active(combo);
+    if (index >= 0 && (uint32_t)index < g_state.source_count) {
+        send_default_source_command(g_state.sources[index].name);
+    }
+}
+
+static void on_overamp_toggled(GtkCheckButton* btn, gpointer data) {
+    (void)data;
+    if (g_updating_ui) return;
+    send_overamp_command(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(btn)));
+}
+
+static void on_app_sink_changed(GtkComboBox* combo, gpointer data) {
+    uint32_t index = GPOINTER_TO_UINT(data);
+    if (g_updating_ui) return;
+    
+    // Find device name from combo text
+    // Note: This is simple but slightly fragile if device names have odd characters
+    // Better would be to store ID in model, but for C/GTK basic client this is fine
+    const char* active_id = gtk_combo_box_get_active_id(combo);
+    if (active_id) {
+        send_move_app_command(index, active_id);
+    }
+}
+
 static void on_app_volume_changed(GtkRange* range, gpointer data) {
     uint32_t index = GPOINTER_TO_UINT(data);
     if (g_updating_ui) return;
@@ -331,8 +392,21 @@ static void refresh_app_list(void) {
         gtk_box_pack_start(GTK_BOX(row), scale, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(row), mute, FALSE, FALSE, 0);
         
+        // App Sink Combo
+        GtkWidget* combo = gtk_combo_box_text_new();
+        g_object_set_data(G_OBJECT(row), "combo", combo);
+        for (uint32_t s = 0; s < g_state.sink_count; s++) {
+            gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), 
+                g_state.sinks[s].name, g_state.sinks[s].description);
+        }
+        if (g_state.apps[i].sink[0]) {
+            gtk_combo_box_set_active_id(GTK_COMBO_BOX(combo), g_state.apps[i].sink);
+        }
+        gtk_box_pack_start(GTK_BOX(row), combo, FALSE, FALSE, 0);
+        
         g_signal_connect(scale, "value-changed", G_CALLBACK(on_app_volume_changed), GUINT_TO_POINTER(g_state.apps[i].index));
         g_signal_connect(mute, "toggled", G_CALLBACK(on_app_mute_toggled), GUINT_TO_POINTER(g_state.apps[i].index));
+        g_signal_connect(combo, "changed", G_CALLBACK(on_app_sink_changed), GUINT_TO_POINTER(g_state.apps[i].index));
         
         gtk_box_pack_start(GTK_BOX(g_apps_box), row, FALSE, FALSE, 0);
     }
@@ -366,6 +440,14 @@ static void refresh_app_list(void) {
                 g_print("DEBUG: Updating App %u mute: %d -> %d\n", i, cur_muted, g_state.apps[i].muted);
                 gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(mute), g_state.apps[i].muted);
             }
+        }
+        
+        GtkWidget* combo = GTK_WIDGET(g_object_get_data(G_OBJECT(row), "combo"));
+        if (combo && g_state.apps[i].sink[0]) {
+             const char* active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo));
+             if (!active_id || strcmp(active_id, g_state.apps[i].sink) != 0) {
+                 gtk_combo_box_set_active_id(GTK_COMBO_BOX(combo), g_state.apps[i].sink);
+             }
         }
     }
     g_list_free(children);
@@ -430,6 +512,22 @@ static gboolean update_ui(gpointer data) {
                         gtk_combo_box_set_active(GTK_COMBO_BOX(g_sinks_combo), i);
                     }
                 }
+                
+                // Update sources combo
+                gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(g_sources_combo));
+                for (uint32_t i = 0; i < g_state.source_count && i < MAX_DEVICES; i++) {
+                    char label[256];
+                    snprintf(label, sizeof(label), "%s%s", 
+                        g_state.sources[i].description,
+                        g_state.sources[i].is_default ? " ✓" : "");
+                    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_sources_combo), label);
+                    if (g_state.sources[i].is_default) {
+                        gtk_combo_box_set_active(GTK_COMBO_BOX(g_sources_combo), i);
+                    }
+                }
+                
+                // Update overamp
+                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_overamp_check), g_state.overamplification);
 
                 // Update Apps
                 refresh_app_list();
@@ -520,6 +618,12 @@ int main(int argc, char** argv) {
     
     gtk_box_pack_start(GTK_BOX(vol_box), vol_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vol_box), g_volume_scale, TRUE, TRUE, 0);
+    
+    // Overamp check
+    g_overamp_check = gtk_check_button_new_with_label(">100%");
+    gtk_box_pack_start(GTK_BOX(vol_box), g_overamp_check, FALSE, FALSE, 0);
+    g_signal_connect(g_overamp_check, "toggled", G_CALLBACK(on_overamp_toggled), NULL);
+    
     gtk_box_pack_start(GTK_BOX(vol_box), g_mute_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(main_box), vol_box, FALSE, FALSE, 5);
     
@@ -556,6 +660,18 @@ int main(int argc, char** argv) {
     gtk_box_pack_start(GTK_BOX(main_box), sink_box, FALSE, FALSE, 5);
     
     g_signal_connect(g_sinks_combo, "changed", G_CALLBACK(on_sink_changed), NULL);
+    
+    // Input devices
+    GtkWidget* src_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget* src_label = gtk_label_new("🎤 Input:");
+    gtk_widget_set_size_request(src_label, 100, -1);
+    g_sources_combo = gtk_combo_box_text_new();
+    
+    gtk_box_pack_start(GTK_BOX(src_box), src_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(src_box), g_sources_combo, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(main_box), src_box, FALSE, FALSE, 5);
+    
+    g_signal_connect(g_sources_combo, "changed", G_CALLBACK(on_source_changed), NULL);
     
     // Apps section title
     GtkWidget* app_title = gtk_label_new(NULL);
