@@ -1,6 +1,6 @@
 # 🐍 VenomMemory Rust
 
-**The world's fastest IPC library in Rust.**
+**IPC library in Rust.**
 
 [![Performance](https://img.shields.io/badge/Bandwidth-37.5%20GB%2Fs-brightgreen)](https://github.com/venom/memory)
 [![Latency](https://img.shields.io/badge/Latency-48%C2%B5s-blue)](https://github.com/venom/memory)
