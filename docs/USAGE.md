@@ -1,23 +1,23 @@
 # 📚 VenomMemory Usage Guide
 
-دليل شامل لاستخدام مكتبة VenomMemory للتواصل بين العمليات (IPC).
+A comprehensive guide to using the VenomMemory library for inter-process communication (IPC).
 
 ---
 
-## 🎯 نظرة عامة
+## 🎯 Overview
 
-VenomMemory هي مكتبة IPC عالية الأداء تستخدم الذاكرة المشتركة. تعتمد على نموذج **Daemon-Shell**:
+VenomMemory is a high-performance IPC library using shared memory. It is based on the **Daemon-Shell** model:
 
-| المكون | الدور | العمليات |
-|--------|------|----------|
-| **Daemon** | الخادم/الكاتب | إنشاء القناة، كتابة البيانات، استقبال الأوامر |
-| **Shell** | العميل/القارئ | الاتصال بالقناة، قراءة البيانات، إرسال الأوامر |
+| Component | Role | Processes |
+|-----------|------|-----------|
+| **Daemon** | Server/Writer | Create channel, write data, receive commands |
+| **Shell** | Client/Reader | Connect to channel, read data, send commands |
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        DAEMON                               │
 │  ┌─────────────────┐    ┌─────────────────┐                │
-│  │  write_data()   │──▶│   try_recv()    │◀─ أوامر        │
+│  │  write_data()   │──▶│   try_recv()    │◀─ Commands    │
 │  └─────────────────┘    └─────────────────┘                │
 └─────────────────────────────┬───────────────────────────────┘
                               │ Shared Memory
@@ -32,7 +32,7 @@ VenomMemory هي مكتبة IPC عالية الأداء تستخدم الذاك�
 
 ---
 
-## 📦 التثبيت
+## 📦 Installation
 
 ### Cargo.toml (Rust)
 ```toml
@@ -42,11 +42,11 @@ venom_memory = { path = "../venom_memory_rs" }
 
 ### C/C++
 ```bash
-# نسخ الملفات
+# Copy files
 cp target/release/libvenom_memory.so /usr/local/lib/
 cp venom_memory_rs.h /usr/local/include/
 
-# الربط
+# Link
 gcc -o myapp myapp.c -lvenom_memory
 ```
 
@@ -59,43 +59,43 @@ dependencies:
 
 ---
 
-## 🔧 الاستخدام الأساسي (Rust)
+## 🔧 Basic Usage (Rust)
 
-### 1️⃣ إنشاء Daemon (الخادم)
+### 1️⃣ Create Daemon (Server)
 
 ```rust
 use venom_memory::{DaemonChannel, ChannelConfig};
 
 fn main() {
-    // تكوين القناة
+    // Configure the channel
     let config = ChannelConfig {
-        data_size: 1024,      // حجم البيانات (بايت)
-        cmd_slots: 16,        // عدد خانات الأوامر
-        max_clients: 8,       // أقصى عدد للعملاء
+        data_size: 1024,      // Data size (bytes)
+        cmd_slots: 16,        // Number of command slots
+        max_clients: 8,       // Maximum number of clients
     };
 
-    // إنشاء القناة
+    // Create the channel
     let daemon = DaemonChannel::create("my_channel", config)
-        .expect("فشل إنشاء القناة");
+        .expect("Failed to create channel");
 
-    println!("✅ تم إنشاء القناة: my_channel");
+    println!("✅ Channel created: my_channel");
 
     loop {
-        // كتابة البيانات
+        // Write data
         let data = b"Hello from daemon!";
         daemon.write_data(data);
 
-        // استقبال الأوامر (غير محجوب)
+        // Receive commands (non-blocking)
         let mut cmd_buf = [0u8; 64];
         if let Some((client_id, len)) = daemon.try_recv_command(&mut cmd_buf) {
             let cmd = String::from_utf8_lossy(&cmd_buf[..len]);
-            println!("📥 أمر من العميل {}: {}", client_id, cmd);
+            println!("📥 Command from client {}: {}", client_id, cmd);
             
-            // معالجة الأمر
+            // Handle command
             match cmd.as_ref() {
                 "PING" => println!("PONG!"),
                 "STOP" => break,
-                _ => println!("أمر غير معروف"),
+                _ => println!("Unknown command"),
             }
         }
 
@@ -104,29 +104,29 @@ fn main() {
 }
 ```
 
-### 2️⃣ إنشاء Shell (العميل)
+### 2️⃣ Create Shell (Client)
 
 ```rust
 use venom_memory::ShellChannel;
 
 fn main() {
-    // الاتصال بالقناة
+    // Connect to the channel
     let shell = ShellChannel::connect("my_channel")
-        .expect("فشل الاتصال");
+        .expect("Failed to connect");
 
-    println!("✅ متصل! معرف العميل: {}", shell.client_id());
+    println!("✅ Connected! Client ID: {}", shell.client_id());
 
-    // إرسال أمر للخادم
+    // Send command to server
     shell.try_send_command(b"PING");
-    println!("📤 تم إرسال PING");
+    println!("📤 PING sent");
 
-    // قراءة البيانات
+    // Read data
     let mut buf = vec![0u8; 1024];
     loop {
         let len = shell.read_data(&mut buf);
         if len > 0 {
             let data = String::from_utf8_lossy(&buf[..len]);
-            println!("📥 بيانات: {}", data);
+            println!("📥 Data: {}", data);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -135,13 +135,13 @@ fn main() {
 
 ---
 
-## 📊 نقل البيانات المهيكلة (Structs)
+## 📊 Transferring Structured Data (Structs)
 
-### تعريف الهيكل المشترك
+### Define Shared Struct
 
 ```rust
-// يجب أن يكون متطابقاً في الخادم والعميل!
-#[repr(C)]  // مهم جداً للتوافق مع C
+// Must be identical on server and client!
+#[repr(C)]  // Very important for C compatibility
 #[derive(Clone, Copy, Default)]
 pub struct SensorData {
     pub temperature: f32,
@@ -151,7 +151,7 @@ pub struct SensorData {
 }
 ```
 
-### الكتابة (Daemon)
+### Writing (Daemon)
 
 ```rust
 let data = SensorData {
@@ -161,7 +161,7 @@ let data = SensorData {
     timestamp: 1234567890,
 };
 
-// تحويل الهيكل إلى بايتات
+// Convert struct to bytes
 let bytes = unsafe {
     std::slice::from_raw_parts(
         &data as *const SensorData as *const u8,
@@ -172,7 +172,7 @@ let bytes = unsafe {
 daemon.write_data(bytes);
 ```
 
-### القراءة (Shell)
+### Reading (Shell)
 
 ```rust
 let mut buf = vec![0u8; std::mem::size_of::<SensorData>() + 64];
@@ -182,18 +182,18 @@ if len >= std::mem::size_of::<SensorData>() {
     let data: SensorData = unsafe {
         std::ptr::read(buf.as_ptr() as *const SensorData)
     };
-    println!("🌡️ درجة الحرارة: {}°C", data.temperature);
+    println!("🌡️ Temperature: {}°C", data.temperature);
 }
 ```
 
 ---
 
-## 🔌 الاستخدام من C
+## 🔌 Usage from C
 
-### الهيدر (venom_memory_rs.h)
+### Header (venom_memory_rs.h)
 
 ```c
-// الأنواع
+// Types
 typedef struct VenomDaemonHandle VenomDaemonHandle;
 typedef struct VenomShellHandle VenomShellHandle;
 
@@ -203,12 +203,12 @@ typedef struct {
     size_t max_clients;
 } VenomConfig;
 
-// دوال الخادم
+// Daemon functions
 VenomDaemonHandle* venom_daemon_create(const char* name, VenomConfig config);
 void venom_daemon_destroy(VenomDaemonHandle* handle);
 void venom_daemon_write_data(VenomDaemonHandle* handle, const uint8_t* data, size_t len);
 
-// دوال العميل
+// Client functions
 VenomShellHandle* venom_shell_connect(const char* name);
 void venom_shell_destroy(VenomShellHandle* handle);
 size_t venom_shell_read_data(VenomShellHandle* handle, uint8_t* buf, size_t max_len);
@@ -216,29 +216,29 @@ uint32_t venom_shell_id(VenomShellHandle* handle);
 bool venom_shell_send_command(VenomShellHandle* handle, const uint8_t* cmd, size_t len);
 ```
 
-### مثال C
+### C Example
 
 ```c
 #include <stdio.h>
 #include "venom_memory_rs.h"
 
 int main() {
-    // الاتصال
+    // Connect
     VenomShellHandle* shell = venom_shell_connect("my_channel");
     if (!shell) {
-        printf("❌ فشل الاتصال\n");
+        printf("❌ Connection failed\n");
         return 1;
     }
     
-    printf("✅ متصل! ID: %u\n", venom_shell_id(shell));
+    printf("✅ Connected! ID: %u\n", venom_shell_id(shell));
     
-    // إرسال أمر
+    // Send command
     venom_shell_send_command(shell, (uint8_t*)"PING", 4);
     
-    // قراءة
+    // Read
     uint8_t buf[1024];
     size_t len = venom_shell_read_data(shell, buf, sizeof(buf));
-    printf("📥 استلمت %zu بايت\n", len);
+    printf("📥 Received %zu bytes\n", len);
     
     venom_shell_destroy(shell);
     return 0;
@@ -247,7 +247,7 @@ int main() {
 
 ---
 
-## 📱 الاستخدام من Flutter/Dart
+## 📱 Usage from Flutter/Dart
 
 ### venom_memory.dart
 
@@ -311,7 +311,7 @@ class VenomShell {
 }
 ```
 
-### استخدام في Flutter Widget
+### Usage in Flutter Widget
 
 ```dart
 class SensorWidget extends StatefulWidget {
@@ -353,7 +353,7 @@ class _SensorWidgetState extends State<SensorWidget> {
         Text('🌡️ $_temperature°C'),
         ElevatedButton(
           onPressed: _sendCommand,
-          child: Text('معايرة'),
+          child: Text('Calibrate'),
         ),
       ],
     );
@@ -363,99 +363,99 @@ class _SensorWidgetState extends State<SensorWidget> {
 
 ---
 
-## 📝 API المرجعية
+## 📝 API Reference
 
 ### DaemonChannel
 
-| الدالة | الوصف |
-|--------|-------|
-| `create(name, config)` | إنشاء قناة جديدة |
-| `write_data(bytes)` | كتابة بيانات (يقرأها جميع الشللز) |
-| `try_recv_command(buf)` | استقبال أمر (غير محجوب) |
-| `as_ptr()` | مؤشر خام للذاكرة |
+| Function | Description |
+|----------|-------------|
+| `create(name, config)` | Create a new channel |
+| `write_data(bytes)` | Write data (read by all shells) |
+| `try_recv_command(buf)` | Receive command (non-blocking) |
+| `as_ptr()` | Raw memory pointer |
 
 ### ShellChannel
 
-| الدالة | الوصف |
-|--------|-------|
-| `connect(name)` | الاتصال بقناة موجودة |
-| `read_data(buf)` | قراءة بيانات من الخادم |
-| `try_send_command(bytes)` | إرسال أمر للخادم |
-| `client_id()` | معرف العميل الفريد |
-| `as_ptr()` | مؤشر خام للذاكرة |
+| Function | Description |
+|----------|-------------|
+| `connect(name)` | Connect to existing channel |
+| `read_data(buf)` | Read data from server |
+| `try_send_command(bytes)` | Send command to server |
+| `client_id()` | Unique client ID |
+| `as_ptr()` | Raw memory pointer |
 
 ### ChannelConfig
 
-| الحقل | النوع | الوصف |
-|-------|------|-------|
-| `data_size` | `usize` | حجم منطقة البيانات |
-| `cmd_slots` | `usize` | عدد خانات الأوامر |
-| `max_clients` | `usize` | أقصى عدد للعملاء |
+| Field | Type | Description |
+|-------|------|-------------|
+| `data_size` | `usize` | Data area size |
+| `cmd_slots` | `usize` | Number of command slots |
+| `max_clients` | `usize` | Maximum number of clients |
 
 ---
 
-## ⚠️ ملاحظات مهمة
+## ⚠️ Important Notes
 
-### 1. تطابق الهياكل
+### 1. Struct Alignment
 ```rust
-// الخادم والعميل يجب أن يستخدموا نفس الهيكل!
-#[repr(C)]  // إجباري للتوافق
+// Server and client must use the same struct!
+#[repr(C)]  // Mandatory for compatibility
 struct MyData {
-    field1: f32,  // نفس الترتيب
-    field2: u32,  // نفس الأنواع
+    field1: f32,  // Same order
+    field2: u32,  // Same types
 }
 ```
 
-### 2. معالجة الأخطاء
+### 2. Error Handling
 ```rust
-// تحقق دائماً من نجاح الاتصال
+// Always check for successful connection
 let shell = match ShellChannel::connect("channel") {
     Ok(s) => s,
     Err(e) => {
-        eprintln!("فشل الاتصال: {:?}", e);
+        eprintln!("Connection failed: {:?}", e);
         return;
     }
 };
 ```
 
-### 3. تنظيف الموارد
+### 3. Resource Cleanup
 ```rust
-// الموارد تُحرر تلقائياً في Rust (Drop)
-// في C يجب استدعاء destroy:
+// Resources are automatically freed in Rust (Drop)
+// In C you must call destroy:
 venom_shell_destroy(shell);
 ```
 
-### 4. الأمان متعدد الخيوط
+### 4. Thread Safety
 ```rust
-// VenomMemory آمنة للخيوط (Thread-safe)
-// يمكن مشاركة Shell بين خيوط متعددة
+// VenomMemory is thread-safe
+// Shell can be shared between multiple threads
 let shell = Arc::new(shell);
 ```
 
 ---
 
-## 🚀 أفضل الممارسات
+## 🚀 Best Practices
 
-1. **استخدم `#[repr(C)]`** لجميع الهياكل المشتركة
-2. **تحقق من حجم البيانات** قبل القراءة
-3. **لا تحجب الخادم** - استخدم `try_recv_command`
-4. **اختر حجم مناسب** لـ `data_size` و `cmd_slots`
-5. **أوقف الخادم** بأمان عند الإنهاء
-
----
-
-## 📊 الأداء المتوقع
-
-| المقياس | القيمة |
-|---------|--------|
-| عرض النطاق | ~40 GB/s |
-| زمن الاستجابة | ~50 µs |
-| syscalls | 0 (بعد الإنشاء) |
+1. **Use `#[repr(C)]`** for all shared structs
+2. **Check data size** before reading
+3. **Don't block the daemon** - use `try_recv_command`
+4. **Choose appropriate sizes** for `data_size` and `cmd_slots`
+5. **Shutdown the daemon** safely on exit
 
 ---
 
-## 🔗 روابط مفيدة
+## 📊 Expected Performance
 
-- [docs/ARCHITECTURE.md](ARCHITECTURE.md) - البنية التقنية
-- [examples/system_daemon.rs](../examples/system_daemon.rs) - مثال كامل
-- [examples/status_bar.rs](../examples/status_bar.rs) - مثال العميل
+| Metric | Value |
+|--------|-------|
+| Bandwidth | ~40 GB/s |
+| Latency | ~50 µs |
+| syscalls | 0 (after creation) |
+
+---
+
+## 🔗 Useful Links
+
+- [docs/ARCHITECTURE.md](ARCHITECTURE.md) - Technical architecture
+- [examples/system_daemon.rs](../examples/system_daemon.rs) - Complete example
+- [examples/status_bar.rs](../examples/status_bar.rs) - Client example

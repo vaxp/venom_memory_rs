@@ -1,69 +1,69 @@
 # 🐍 VenomMemory Rust
 
-**مكتبة IPC الأسرع في العالم بلغة Rust.**
+**The world's fastest IPC library in Rust.**
 
 [![Performance](https://img.shields.io/badge/Bandwidth-37.5%20GB%2Fs-brightgreen)](https://github.com/venom/memory)
 [![Latency](https://img.shields.io/badge/Latency-48%C2%B5s-blue)](https://github.com/venom/memory)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-مكتبة اتصالات بين العمليات (IPC) تعتمد على الذاكرة المشتركة (Shared Memory) بنمط **Lock-Free** لتحقيق أقصى أداء ممكن.
+An inter-process communication (IPC) library based on Shared Memory with **Lock-Free** design to achieve maximum possible performance.
 
-## 🚀 الأداء المثبت
-ملاحضه الاختبار استمر الى 20دقيقه 
-تم كسر الرقم القياسي العالمي السابق (23.3 GB/s) وتحقيق:
+## 🚀 Proven Performance
+Note: Test ran for 20 minutes
+Breaking the previous record (23.3 GB/s) and achieving:
 
 - **Bandwidth**: 37.52 GB/s (+61%)
 - **Throughput**: > 70,000 req/s
-- **Utilization**: 98% من الحد النظري للذاكرة (DDR4)
+- **Utilization**: 98% of theoretical DDR4 memory limit
 
 ---
 
-## 📦 التثبيت
+## 📦 Installation
 
-أضف المكتبة إلى ملف `Cargo.toml`:
+Add the library to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-venom_memory = { path = "." } # أو رابط git
+venom_memory = { path = "." } # or git link
 ```
 
 ---
 
-## 🛠️ كيفية الاستخدام
+## 🛠️ How to Use
 
-تعتمد المكتبة على هيكلية **Daemon (الكاتب)** و **Shell (القارئ)**:
+The library is based on a **Daemon (Writer)** and **Shell (Reader)** architecture:
 
-### 1. الخادم (Writer / Daemon)
+### 1. Server (Writer / Daemon)
 
-الخادم هو المسؤول عن إنشاء القناة وإدارتها. هو الوحيد الذي يكتب البيانات التي يراها الجميع.
+The server is responsible for creating and managing the channel. It is the only one who writes the data that everyone sees.
 
 ```rust
 use venom_memory::{DaemonChannel, ChannelConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. إعداد القناة
+    // 1. Configure the channel
     let config = ChannelConfig {
-        data_size: 64 * 1024, // 64KB حجم البيانات
-        cmd_slots: 128,       // عدد الأوامر في الطابور
-        max_clients: 16,      // أقصى عدد للمتصلين
+        data_size: 64 * 1024, // 64KB data size
+        cmd_slots: 128,       // Number of commands in queue
+        max_clients: 16,      // Maximum number of clients
     };
 
-    // 2. إنشاء القناة باسم "my_channel"
+    // 2. Create channel named "my_channel"
     let daemon = DaemonChannel::create("my_channel", config)?;
     println!("Daemon started on channel: my_channel");
 
-    // 3. الاستماع للأوامر ومعالجتها
+    // 3. Listen and handle commands
     daemon.run(|client_id, cmd| {
-        // تحويل الأمر إلى نص
+        // Convert command to text
         let cmd_str = String::from_utf8_lossy(cmd);
         println!("Received from {}: {}", client_id, cmd_str);
 
-        // تنفيذ المنطق وإرجاع الرد
+        // Execute logic and return response
         if cmd_str.contains("ping") {
             return b"pong".to_vec();
         }
 
-        // كتابة بيانات يراها الجميع (تحديث الحالة)
+        // Write data visible to everyone (state update)
         // daemon.write_data(b"New Global State Here");
 
         b"Unknown command".to_vec()
@@ -73,24 +73,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 2. العميل (Reader / Shell)
+### 2. Client (Reader / Shell)
 
-العميل يتصل بالقناة، يقرأ البيانات لحظياً، ويرسل أوامر للخادم.
+The client connects to the channel, reads data instantaneously, and sends commands to the server.
 
 ```rust
 use venom_memory::ShellChannel;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. الاتصال بالقناة
+    // 1. Connect to the channel
     let shell = ShellChannel::connect("my_channel")?;
     println!("Connected with Client ID: {}", shell.client_id());
 
-    // 2. قراءة البيانات الحالية (بدون انتظار/قفل)
+    // 2. Read current data (without waiting/locking)
     let mut data_buf = [0u8; 1024];
     let len = shell.read_data(&mut data_buf);
     println!("Current Data: {:?}", &data_buf[..len]);
 
-    // 3. إرسال أمر وانتظار الرد (RPC style)
+    // 3. Send command and wait for response (RPC style)
     let mut response_buf = [0u8; 1024];
     let resp_len = shell.request(b"ping", &mut response_buf);
     
@@ -103,48 +103,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## 🔄 كيف يعمل التواصل؟
+## 🔄 How Does Communication Work?
 
-1.  **القراءة (SeqLock)**:
-    *   الخادم يكتب البيانات.
-    *   العملاء يقرأون البيانات مباشرة دون أي قفل (Lock-Free).
-    *   إذا حدثت كتابة أثناء القراءة، تعيد المكتبة المحاولة تلقائياً (تضمن قراءة متسقة دائماً).
+1.  **Reading (SeqLock)**:
+    *   The server writes data.
+    *   Clients read data directly without any locks (Lock-Free).
+    *   If a write occurs during reading, the library automatically retries (guarantees consistent reads).
 
-2.  **الكتابة (MPSC Queue)**:
-    *   العملاء يرسلون الأوامر إلى طابور Commands.
-    *   الخادم يسحب الأوامر واحداً تلو الآخر ويعالجها.
-    *   الخادم يكتب الرد في منطقة البيانات المشتركة أو منطقة مخصصة للردود.
-
----
-
-## 🌟 القدرات وحالات الاستخدام
-
-بفضل الأداء "شبه المستحيل" (37.5 GB/s)، هذه المكتبة تفتح آفاقاً جديدة للمشاريع التي كانت محدودة سابقاً ببطء التواصل بين العمليات.
-
-### 1. تطبيقات التداول المالي (HFT & Fintech)
-*   **القدرة**: زمن استجابة (Latency) أقل من 50 ميكروثانية.
-*   **الاستخدام**: نقل بيانات السوق (Market Data) وتنفيذ الأوامر بين خوارزميات التداول وبوابات البورصة على نفس الخادم بسرعة تفوق شبكات TCP/IP بمئات المرات.
-
-### 2. معالجة الفيديو والصور لحظياً (Real-time Video Processing)
-*   **القدرة**: عرض نطاق (Bandwidth) يصل إلى 37.5 GB/s.
-*   **الاستخدام**:
-    *   نقل إطارات فيديو بدقة **8K Raw uncompressed** (تتطلب ~2-4 GB/s فقط!).
-    *   نقل البيانات بين عمليات الذكاء الاصطناعي (AI Inference) وعمليات العرض (Rendering).
-
-### 3. محركات الألعاب وأنظمة المحاكاة (Game Engines & Simulation)
-*   **القدرة**: تحديث الحالة لأكثر من 20 مليون مرة دون تدهور في الأداء.
-*   **الاستخدام**: فصل الفيزياء (Physics)، والذكاء الاصطناعي (AI)، والشبكات في عمليات منفصلة لحماية اللعبة من الانهيار (Crash Safe) مع الحفاظ على تزامن "أسرع من الإطار الواحد".
-
-### 4. الروبوتات والأنظمة المدمجة (Robotics & Autonomous Systems)
-*   **القدرة**: Lock-free reads (لا توجد أقفال توقف النظام).
-*   **الاستخدام**: مشاركة بيانات المستشعرات (Lidar, Cameras, IMU) بين أنظمة التحكم المختلفة دون خطر توقف النظام بسبب "Deadlock".
-
-### 5. قواعد البيانات والأنظمة الموزعة محلياً
-*   **الاستخدام**: كطبقة نقل بيانات فائقة السرعة (Transporter Layer) بين الـ Shards أو الـ Sidecars في البنى التحتية للميكروسيرفس (Microservices) التي تعمل على نفس الجهاز.
+2.  **Writing (MPSC Queue)**:
+    *   Clients send commands to the Commands queue.
+    *   The server pulls commands one by one and processes them.
+    *   The server writes the response in the shared data area or a dedicated response area.
 
 ---
 
-## ⚠️ متطلبات النظام
-*   **CPU**: x86_64 مستحسن (لضمان atomic operations السريعة).
+## 🌟 Capabilities and Use Cases
+
+### 1. Financial Trading Applications (HFT & Fintech)
+*   **Capability**: Latency less than 50 microseconds.
+*   **Usage**: Transfer market data and execute orders between trading algorithms and exchange gateways on the same server at speeds that exceed TCP/IP networks by hundreds of times.
+
+### 2. Real-time Video Processing
+*   **Capability**: 98% of theoretical memory limit
+*   **Usage**:
+    *   Transfer **8K Raw uncompressed** video frames (only requires ~2-4 GB/s!).
+    *   Transfer data between AI Inference processes and Rendering processes.
+
+### 3. Game Engines and Simulation Systems
+*   **Capability**: Update state over 20 million times without performance degradation.
+*   **Usage**: Separate Physics, AI, and Networking in separate processes to protect the game from crashes (Crash Safe) while maintaining "sub-frame" synchronization.
+
+### 4. Robotics and Embedded Systems
+*   **Capability**: Lock-free reads (no system-stopping locks).
+*   **Usage**: Share sensor data (Lidar, Cameras, IMU) between different control systems without risk of system deadlock.
+
+### 5. Databases and Locally Distributed Systems
+*   **Usage**: As an ultra-fast data transport layer between Shards or Sidecars in microservices infrastructure running on the same machine.
+
+---
+
+## ⚠️ System Requirements
+*   **CPU**: x86_64 recommended (to ensure fast atomic operations).
 *   **Rust**: Stable 1.70+.
 # venom_memory_rs
